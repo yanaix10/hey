@@ -32,7 +32,7 @@ sudo systemctl enable --now avahi-daemon.service
 
 **Install Binaries & Background Service:**
 ```bash
-git clone [https://github.com/](https://github.com/)<your-username>/hey.git
+git clone [https://github.com/](https://github.com/)yanaix10/hey.git
 cd hey
 chmod +x install.sh
 ./install.sh
@@ -87,7 +87,7 @@ sudo ufw allow 5353/udp
 **1. Clone and Run Installer:**
 Open PowerShell and run:
 ```powershell
-git clone [https://github.com/](https://github.com/)<your-username>/hey.git
+git clone [https://github.com/](https://github.com/)yanaix10/hey.git
 cd hey
 Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 .\install.ps1
@@ -108,7 +108,7 @@ New-NetFirewallRule -DisplayName "HeyChat-mDNS" -Direction Inbound -Protocol UDP
 
 **1. Build and Install Binaries:**
 ```bash
-git clone [https://github.com/](https://github.com/)<your-username>/hey.git
+git clone [https://github.com/](https://github.com/)yanaix10/hey.git
 cd hey
 go build -o hey ./cmd/hey
 go build -o heyd ./cmd/heyd
