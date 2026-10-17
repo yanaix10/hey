@@ -37,7 +37,7 @@ $ExecutionContext.InvokeCommand.CommandNotFoundAction = {
 }
 '@
 if (!(Select-String -Path $PROFILE -Pattern "hey@" -Quiet)) {
-    Add-Content -Path $PROFILE -Value$hook
+    Add-Content -Path $PROFILE -Value $hook
 }
 
 Write-Host "Installation complete! Restart PowerShell and type hey@username"
