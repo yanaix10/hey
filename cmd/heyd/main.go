@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"heychat/internal/discovery"
 	"heychat/internal/notify"
@@ -17,7 +18,7 @@ import (
 func main() {
 	username := os.Getenv("USER")
 	if username == "" {
-		username = os.Getenv("USERNAME") // Windows fallback
+		username = os.Getenv("USERNAME")
 	}
 	if username == "" {
 		username = "anonymous"
@@ -25,9 +26,13 @@ func main() {
 
 	server, err := discovery.Register(username)
 	if err != nil {
-		log.Fatalf("Failed to start mDNS: %v", err)
+		log.Printf("Warning: mDNS failed: %v", err)
+	} else {
+		defer server.Shutdown()
 	}
-	defer server.Shutdown()
+
+	// Connect to global relay in the background
+	go maintainRelayConn(username)
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", discovery.Port))
 	if err != nil {
@@ -39,7 +44,9 @@ func main() {
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sig
-		server.Shutdown()
+		if server != nil {
+			server.Shutdown()
+		}
 		os.Exit(0)
 	}()
 
@@ -48,17 +55,57 @@ func main() {
 		if err != nil {
 			continue
 		}
-		go handlePing(conn)
+		go handleLocalPing(conn)
 	}
 }
 
-func handlePing(conn net.Conn) {
+func maintainRelayConn(username string) {
+	relayAddr := discovery.GetRelayAddr()
+	for {
+		conn, err := net.DialTimeout("tcp", relayAddr, 5*time.Second)
+		if err != nil {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		fmt.Fprintf(conn, "REGISTER %s\n", username)
+		reader := bufio.NewReader(conn)
+
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				conn.Close()
+				break
+			}
+			parts := strings.Fields(strings.TrimSpace(line))
+			if len(parts) == 3 && parts[0] == "PING" {
+				go handleRelayPing(relayAddr, parts[1], parts[2])
+			}
+		}
+		time.Sleep(3 * time.Second)
+	}
+}
+
+func handleRelayPing(relayAddr, sessionID, sender string) {
+	accepted := notify.Prompt(sender + " (via Relay)")
+	decisionConn, err := net.DialTimeout("tcp", relayAddr, 5*time.Second)
+	if err != nil {
+		return
+	}
+	defer decisionConn.Close()
+
+	if accepted {
+		fmt.Fprintf(decisionConn, "DECISION %s accepted\n", sessionID)
+		notify.SpawnTerminal("relay:" + sessionID)
+	} else {
+		fmt.Fprintf(decisionConn, "DECISION %s rejected\n", sessionID)
+	}
+}
+
+func handleLocalPing(conn net.Conn) {
 	defer conn.Close()
+	peerIP := strings.Split(conn.RemoteAddr().String(), ":")[0]
 
-	peerAddr := conn.RemoteAddr().String()
-	peerIP := strings.Split(peerAddr, ":")[0]
-
-	// Read session request format: "CHAT_PORT:4243\n"
 	reader := bufio.NewReader(conn)
 	msg, err := reader.ReadString('\n')
 	if err != nil {
@@ -72,14 +119,10 @@ func handlePing(conn net.Conn) {
 	}
 
 	chatTarget := fmt.Sprintf("%s:%s", peerIP, chatPort)
-	fmt.Printf("Chat requested from %s. Asking user...\n", chatTarget)
-
 	if notify.Prompt(peerIP) {
-		fmt.Println("Accepted. Spawning terminal...")
 		conn.Write([]byte("accepted\n"))
 		notify.SpawnTerminal(chatTarget)
 	} else {
-		fmt.Println("Declined/Ignored.")
 		conn.Write([]byte("rejected\n"))
 	}
 }
