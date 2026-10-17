@@ -45,6 +45,7 @@ func SpawnTerminal(chatTarget string) {
 	}
 
 	psScript := fmt.Sprintf("& '%s' join '%s'; Read-Host 'Press Enter to exit'", heyBin, chatTarget)
-	cmd := exec.Command("cmd.exe", "/c", "start", "Hey Chat", "powershell.exe", "-NoLogo", "-Command", psScript)
+	cmd := exec.Command("cmd.exe", "/c", "start", "Hey Chat", "powershell.exe", "-NoLogo", "-NoExit", "-Command", psScript)
+
 	_ = cmd.Start()
 }

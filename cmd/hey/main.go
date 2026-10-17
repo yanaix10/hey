@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"bufio"
 
 	"heychat/internal/auth"
 	"heychat/internal/discovery"
@@ -62,7 +63,7 @@ func runLocalSend(target, ip, pin string) {
 	}
 	defer chatListener.Close()
 
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", ip, discovery.Port))
+	conn, err := net.Dial("tcp", net.JoinHostPort(ip, fmt.Sprintf("%d", discovery.Port)))
 	if err != nil {
 		log.Fatalf("Could not reach %s: %v", target, err)
 	}
@@ -181,8 +182,8 @@ func runJoin(targetAddr string) {
 	}
 
 	fmt.Print("\nEnter 6-digit confirmation code: ")
-	var enteredPIN string
-	fmt.Scanln(&enteredPIN)
+	stdinReader := bufio.NewReader(os.Stdin)
+	enteredPIN, _ := stdinReader.ReadString('\n')
 	enteredPIN = strings.TrimSpace(enteredPIN)
 
 	responseHash := sha256.Sum256(append([]byte(enteredPIN), salt...))

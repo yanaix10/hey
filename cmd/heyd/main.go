@@ -104,7 +104,15 @@ func handleRelayPing(relayAddr, sessionID, sender string) {
 
 func handleLocalPing(conn net.Conn) {
 	defer conn.Close()
-	peerIP := strings.Split(conn.RemoteAddr().String(), ":")[0]
+
+	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err != nil {
+		return
+	}
+	// Normalize IPv4-mapped IPv6 address (e.g. ::ffff:192.168.1.5 -> 192.168.1.5)
+	if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
+		host = ip.To4().String()
+	}
 
 	reader := bufio.NewReader(conn)
 	msg, err := reader.ReadString('\n')
@@ -118,8 +126,8 @@ func handleLocalPing(conn net.Conn) {
 		chatPort = parts[1]
 	}
 
-	chatTarget := fmt.Sprintf("%s:%s", peerIP, chatPort)
-	if notify.Prompt(peerIP) {
+	chatTarget := net.JoinHostPort(host, chatPort)
+	if notify.Prompt(host) {
 		conn.Write([]byte("accepted\n"))
 		notify.SpawnTerminal(chatTarget)
 	} else {

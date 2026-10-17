@@ -89,8 +89,15 @@ func StartChat(conn net.Conn, sessionKey []byte) error {
 		}
 	}()
 
-	_, err := p.Run()
-	return err
+		finalModel, err := p.Run()
+	if err != nil {
+		return err
+	}
+	if fm, ok := finalModel.(model); ok && fm.err != nil {
+		return fm.err
+	}
+	return nil
+
 }
 
 func (m model) Init() tea.Cmd {
@@ -109,9 +116,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.Type {
-		case tea.KeyCtrlC, tea.KeyEsc:
+		case tea.KeyCtrlC:
 			m.conn.Close()
 			return m, tea.Quit
+		case tea.KeyEsc:
+			// Do not quit on Esc; ignore escape sequences and keypresses
+			return m, nil
+
 		case tea.KeyEnter:
 			v := m.textarea.Value()
 			if strings.TrimSpace(v) != "" {
@@ -152,7 +163,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case msgReceipt:
 		// Clear typing indicator instantly when a message arrives
-		m.peerTyping = false 
+		m.peerTyping = false
 		style := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
 		displayStr := style.Render("Peer: ") + string(msg)
 		m.messages = append(m.messages, displayStr)
