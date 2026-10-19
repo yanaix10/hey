@@ -2,7 +2,9 @@ package discovery
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"net"
 	"os"
 	"time"
 
@@ -10,10 +12,10 @@ import (
 )
 
 const (
-	ServiceName = "_heychat._tcp"
-	Domain      = "local."
-	Port        = 4242
-	DefaultRelay = "104.214.168.159:4244"
+	ServiceName  = "_heychat._tcp"
+	Domain       = "local."
+	Port         = 4242
+	DefaultRelay = "104.214.168.159:443"
 )
 
 func GetRelayAddr() string {
@@ -21,6 +23,17 @@ func GetRelayAddr() string {
 		return addr
 	}
 	return DefaultRelay
+}
+
+// DialRelay connects to the cloud relay over TLS 1.3 (port 443) to bypass firewall DPI
+func DialRelay() (net.Conn, error) {
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 15 * time.Second,
+	}
+	return tls.DialWithDialer(dialer, "tcp", GetRelayAddr(), &tls.Config{
+		InsecureSkipVerify: true,
+	})
 }
 
 func Register(username string) (*zeroconf.Server, error) {

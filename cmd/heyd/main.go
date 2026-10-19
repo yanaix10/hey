@@ -62,7 +62,7 @@ func main() {
 func maintainRelayConn(username string) {
 	relayAddr := discovery.GetRelayAddr()
 	for {
-		conn, err := net.DialTimeout("tcp", relayAddr, 5*time.Second)
+		conn, err := discovery.DialRelay()
 		if err != nil {
 			time.Sleep(5 * time.Second)
 			continue
@@ -86,9 +86,9 @@ func maintainRelayConn(username string) {
 	}
 }
 
-func handleRelayPing(relayAddr, sessionID, sender string) {
+func handleRelayPing(_, sessionID, sender string) {
 	accepted := notify.Prompt(sender + " (via Relay)")
-	decisionConn, err := net.DialTimeout("tcp", relayAddr, 5*time.Second)
+	decisionConn, err := discovery.DialRelay()
 	if err != nil {
 		return
 	}

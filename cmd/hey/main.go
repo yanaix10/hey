@@ -97,7 +97,7 @@ func runRelaySend(target, pin string) {
 		sender = "peer"
 	}
 
-	conn, err := net.Dial("tcp", discovery.GetRelayAddr())
+	conn, err := discovery.DialRelay()
 	if err != nil {
 		log.Fatalf("Could not connect to relay: %v", err)
 	}
@@ -163,7 +163,7 @@ func runJoin(targetAddr string) {
 
 	if strings.HasPrefix(targetAddr, "relay:") {
 		sessionID := strings.TrimPrefix(targetAddr, "relay:")
-		conn, err = net.Dial("tcp", discovery.GetRelayAddr())
+		conn, err = discovery.DialRelay()
 		if err != nil {
 			log.Fatalf("Failed to connect to relay: %v", err)
 		}

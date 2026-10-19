@@ -2,11 +2,16 @@ package main
 
 import (
 	"bufio"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"os"
 	"strings"
@@ -21,9 +26,33 @@ type pendingSession struct {
 
 var (
 	mu       sync.Mutex
-	daemons  = make(map[string]net.Conn)       // username -> heyd connection
-	sessions = make(map[string]pendingSession) // sessionID -> waiting sender
+	daemons  = make(map[string]net.Conn)
+	sessions = make(map[string]pendingSession)
 )
+
+func generateTLSConfig() *tls.Config {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		log.Fatal(err)
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{{
+			Certificate: [][]byte{derBytes},
+			PrivateKey:  priv,
+		}},
+	}
+}
 
 func main() {
 	port := os.Getenv("PORT")
@@ -31,11 +60,11 @@ func main() {
 		port = "4244"
 	}
 
-	listener, err := net.Listen("tcp", ":"+port)
+	listener, err := tls.Listen("tcp", ":"+port, generateTLSConfig())
 	if err != nil {
 		log.Fatalf("Relay failed to start: %v", err)
 	}
-	log.Printf("hey-relay listening on :%s", port)
+	log.Printf("hey-relay (TLS) listening on :%s", port)
 
 	for {
 		conn, err := listener.Accept()
@@ -61,7 +90,7 @@ func handleConn(conn net.Conn) {
 	}
 
 	switch parts[0] {
-	case "REGISTER": // REGISTER <username>
+	case "REGISTER":
 		if len(parts) < 2 {
 			conn.Close()
 			return
@@ -75,9 +104,8 @@ func handleConn(conn net.Conn) {
 		mu.Unlock()
 		log.Printf("Registered user: %s", username)
 
-		// Send heartbeat every 25s to keep NAT firewall holes open
 		for {
-			time.Sleep(25 * time.Second)
+			time.Sleep(20 * time.Second)
 			if _, err := conn.Write([]byte("HEARTBEAT\n")); err != nil {
 				mu.Lock()
 				if daemons[username] == conn {
@@ -90,7 +118,7 @@ func handleConn(conn net.Conn) {
 			}
 		}
 
-	case "REQUEST": // REQUEST <target> <sender>
+	case "REQUEST":
 		if len(parts) < 3 {
 			conn.Close()
 			return
@@ -101,7 +129,7 @@ func handleConn(conn net.Conn) {
 		daemonConn, online := daemons[target]
 		if !online {
 			mu.Unlock()
-			conn.Write([]byte{2}) // 2 = user offline
+			conn.Write([]byte{2})
 			conn.Close()
 			return
 		}
@@ -112,14 +140,12 @@ func handleConn(conn net.Conn) {
 		sessions[sessionID] = pendingSession{aliceConn: conn, aliceReader: reader}
 		mu.Unlock()
 
-		// Trigger notification on target's daemon
-		_, err := fmt.Fprintf(daemonConn, "PING %s %s\n", sessionID, sender)
-		if err != nil {
+		if _, err := fmt.Fprintf(daemonConn, "PING %s %s\n", sessionID, sender); err != nil {
 			conn.Write([]byte{2})
 			conn.Close()
 		}
 
-	case "DECISION": // DECISION <sessionID> <accepted|rejected>
+	case "DECISION":
 		defer conn.Close()
 		if len(parts) < 3 {
 			return
@@ -135,14 +161,14 @@ func handleConn(conn net.Conn) {
 		if status != "accepted" {
 			delete(sessions, sessionID)
 			mu.Unlock()
-			sess.aliceConn.Write([]byte{0}) // 0 = rejected
+			sess.aliceConn.Write([]byte{0})
 			sess.aliceConn.Close()
 			return
 		}
 		mu.Unlock()
-		sess.aliceConn.Write([]byte{1}) // 1 = accepted, waiting for terminal spawn
+		sess.aliceConn.Write([]byte{1})
 
-	case "BRIDGE": // BRIDGE <sessionID>
+	case "BRIDGE":
 		if len(parts) < 2 {
 			conn.Close()
 			return
@@ -160,45 +186,16 @@ func handleConn(conn net.Conn) {
 			conn.Close()
 			return
 		}
-		// Signal Alice that Bob's spawned terminal has connected
-		if _, err := sess.aliceConn.Write([]byte{1}); err != nil {
-			conn.Close()
-			sess.aliceConn.Close()
-			return
-		}
 
-		log.Printf("[BRIDGE %s] Active between Alice (%s) and Bob (%s)", sessionID, sess.aliceConn.RemoteAddr(), conn.RemoteAddr())
-
-		// Pipe bytes bidirectionally using safe user-space buffers
-		var wg sync.WaitGroup
-		wg.Add(2)
-
-		pipe := func(label string, dst net.Conn, src io.Reader) {
-			defer wg.Done()
-			buf := make([]byte, 32*1024)
-			for {
-				n, err := src.Read(buf)
-				if n > 0 {
-					if _, werr := dst.Write(buf[:n]); werr != nil {
-						log.Printf("[BRIDGE %s] %s write error: %v", sessionID, label, werr)
-						break
-					}
-				}
-				if err != nil {
-					log.Printf("[BRIDGE %s] %s read closed/error: %v", sessionID, label, err)
-					break
-				}
-			}
-		}
-
-		go pipe("Bob->Alice", sess.aliceConn, reader)
-		go pipe("Alice->Bob", conn, sess.aliceReader)
+		sess.aliceConn.Write([]byte{1})
 
 		go func() {
-			wg.Wait()
-			conn.Close()
+			_, _ = io.Copy(sess.aliceConn, reader)
 			sess.aliceConn.Close()
-			log.Printf("[BRIDGE %s] Terminated", sessionID)
+			conn.Close()
 		}()
+		_, _ = io.Copy(conn, sess.aliceReader)
+		conn.Close()
+		sess.aliceConn.Close()
 	}
 }
