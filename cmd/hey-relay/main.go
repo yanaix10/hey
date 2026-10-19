@@ -161,16 +161,42 @@ func handleConn(conn net.Conn) {
 			return
 		}
 		// Signal Alice that Bob's spawned terminal has connected
-        sess.aliceConn.Write([]byte{1})
+		if _, err := sess.aliceConn.Write([]byte{1}); err != nil {
+			conn.Close()
+			sess.aliceConn.Close()
+			return
+		}
 
-        // Use reader and sess.aliceReader as the source (2nd argument)
-        go func() {
-            _, _ = io.Copy(sess.aliceConn, reader) // <-- changed conn to reader
-            sess.aliceConn.Close()
-            conn.Close()
-        }()
-        _, _ = io.Copy(conn, sess.aliceReader) // <-- changed sess.aliceConn to sess.aliceReader
-        conn.Close()
-        sess.aliceConn.Close()
-    }
+		// Pipe bytes bidirectionally using safe user-space buffers (avoids Linux kernel splice bug)
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		pipe := func(dst net.Conn, src io.Reader) {
+			defer wg.Done()
+			buf := make([]byte, 32*1024)
+			for {
+				n, err := src.Read(buf)
+				if n > 0 {
+					if _, werr := dst.Write(buf[:n]); werr != nil {
+						break
+					}
+				}
+				if err != nil {
+					break
+				}
+			}
+			if tc, ok := dst.(*net.TCPConn); ok {
+				_ = tc.CloseWrite()
+			}
+		}
+
+		go pipe(sess.aliceConn, reader)
+		go pipe(conn, sess.aliceReader)
+
+		go func() {
+			wg.Wait()
+			conn.Close()
+			sess.aliceConn.Close()
+		}()
+	}
 }
