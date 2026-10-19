@@ -1,43 +1,47 @@
-Write-Host "Building binaries..."
-go build -o hey.exe ./cmd/hey
-go build -o heyd.exe ./cmd/heyd
+$ErrorActionPreference = "Stop"
 
-$binDir = "$env:USERPROFILE\.local\bin"
-New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+$BinDir = Join-Path $HOME ".local\bin"
+New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 
-Stop-Process -Name "heyd" -Force -ErrorAction SilentlyContinue
-Move-Item -Force hey.exe, heyd.exe $binDir
+Write-Host "[1/4] Building hey.exe and heyd.exe..."
+go build -o "$BinDir\hey.exe" .\cmd\hey
+go build -o "$BinDir\heyd.exe" .\cmd\heyd
 
-# Add ~/.local/bin to User PATH if not already present
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($userPath -notlike "*$binDir*") {
-    [Environment]::SetEnvironmentVariable("Path", "$userPath;$binDir", "User")
-    $env:Path += ";$binDir"
+Write-Host "[2/4] Adding $BinDir to User PATH..."
+$UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($UserPath -notlike "*$BinDir*") {
+    [Environment]::SetEnvironmentVariable("Path", "$UserPath;$BinDir", "User")
+    $env:Path += ";$BinDir"
 }
 
-# Start daemon in background now and register in Windows Startup folder
-$startupDir = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"
-$vbsPath = "$startupDir\heyd-Autostart.vbs"
-Set-Content -Path $vbsPath -Value "Set WshShell = CreateObject(`"WScript.Shell`")`nWshShell.Run `"$binDir\heyd.exe`", 0, False"
-Start-Process "$binDir\heyd.exe" -WindowStyle Hidden
+Write-Host "[3/4] Starting heyd background daemon and registering on startup..."
+Stop-Process -Name "heyd" -Force -ErrorAction SilentlyContinue
+Start-Process -FilePath "$BinDir\heyd.exe" -WindowStyle Hidden
 
-# Inject hey@username hook into PowerShell Profile
-if (!(Test-Path $PROFILE)) {
+$RegPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+Set-ItemProperty -Path $RegPath -Name "HeyChatDaemon" -Value "`"$BinDir\heyd.exe`""
+
+Write-Host "[4/4] Configuring hey@username hook in PowerShell profile..."
+if (!(Test-Path -Path $PROFILE)) {
     New-Item -ItemType File -Path $PROFILE -Force | Out-Null
 }
-$hook = @'
 
+$HookCode = @'
+# >>> hey chat hook >>>
 $ExecutionContext.InvokeCommand.CommandNotFoundAction = {
-    param($CommandName,$CommandLookupEventArgs)
+    param($CommandName, $CommandLookupEventArgs)
     if ($CommandName -match '^hey@(.+)$') {
-        $target =$Matches[1]
-        $CommandLookupEventArgs.CommandScriptBlock = { hey.exe $target }.GetNewClosure()
-        $CommandLookupEventArgs.StopSearch =$true
+        $TargetUser = $Matches[1]
+        $CommandLookupEventArgs.CommandScriptBlock = { & hey.exe $TargetUser }.GetNewClosure()
+        $CommandLookupEventArgs.StopSearch = $true
     }
 }
+# <<< hey chat hook <<<
 '@
-if (!(Select-String -Path $PROFILE -Pattern "hey@" -Quiet)) {
-    Add-Content -Path $PROFILE -Value $hook
+
+$CurrentProfile = Get-Content $PROFILE -Raw -ErrorAction SilentlyContinue
+if ($CurrentProfile -notlike "*hey chat hook*") {
+    Add-Content -Path $PROFILE -Value "`n$HookCode"
 }
 
-Write-Host "Installation complete! Restart PowerShell and type hey@username"
+Write-Host "Installation complete! Restart PowerShell and type: hey@<username>"

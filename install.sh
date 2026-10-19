@@ -1,84 +1,82 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -e
 
-echo "Building binaries..."
-go build -o hey ./cmd/hey
-go build -o heyd ./cmd/heyd
+BIN_DIR="$HOME/.local/bin"
+CONFIG_DIR="$HOME/.config/hey"
+mkdir -p "$BIN_DIR" "$CONFIG_DIR"
 
-echo "Installing to ~/.local/bin..."
-mkdir -p ~/.local/bin
-mv hey heyd ~/.local/bin/
+echo "[1/4] Building hey and heyd..."
+go build -o "$BIN_DIR/hey" ./cmd/hey
+go build -o "$BIN_DIR/heyd" ./cmd/heyd
 
-# Detect OS
+echo "[2/4] Configuring background daemon (heyd)..."
 OS="$(uname -s)"
-
 if [ "$OS" = "Linux" ]; then
-    echo "Creating systemd user service for Linux..."
-    mkdir -p ~/.config/systemd/user
-    cat <<EOF > ~/.config/systemd/user/heyd.service
+    mkdir -p "$HOME/.config/systemd/user"
+    cat <<EOF > "$HOME/.config/systemd/user/heyd.service"
 [Unit]
-Description=Hey P2P Chat Daemon
-After=network.target
+Description=Hey Chat Background Daemon
+After=network-online.target
 
 [Service]
-ExecStart=%h/.local/bin/heyd
+ExecStart=$BIN_DIR/heyd
 Restart=always
 RestartSec=3
-Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin"
 
 [Install]
 WantedBy=default.target
 EOF
-
     systemctl --user daemon-reload
     systemctl --user enable --now heyd.service
-    systemctl --user restart heyd.service
-
 elif [ "$OS" = "Darwin" ]; then
-    echo "Creating launchd plist for macOS..."
-    mkdir -p ~/Library/LaunchAgents
-    cat <<EOF > ~/Library/LaunchAgents/com.hey.heyd.plist
+    PLIST="$HOME/Library/LaunchAgents/com.yanaix10.heyd.plist"
+    mkdir -p "$HOME/Library/LaunchAgents"
+    cat <<EOF > "$PLIST"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key>
-    <string>com.hey.heyd</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$HOME/.local/bin/heyd</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
+    <key>Label</key><string>com.yanaix10.heyd</string>
+    <key>ProgramArguments</key><array><string>$BIN_DIR/heyd</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
 </dict>
 </plist>
 EOF
-
-    launchctl unload ~/Library/LaunchAgents/com.hey.heyd.plist 2>/dev/null
-    launchctl load ~/Library/LaunchAgents/com.hey.heyd.plist
+    launchctl unload "$PLIST" 2>/dev/null || true
+    launchctl load "$PLIST"
 fi
 
-# 1. Configure Zsh if ~/.zshrc exists (Default for macOS)
-if [ -f "$HOME/.zshrc" ] && ! grep -q "command_not_found_handler" "$HOME/.zshrc"; then
-cat << 'EOF' >> "$HOME/.zshrc"
+echo "[3/4] Installing hey@username shell hooks..."
 
-export PATH="$HOME/.local/bin:$PATH"
-command_not_found_handler() {
-    if [[ "$1" =~ ^hey@(.+)$ ]]; then
-        hey "${match[1]}"
+# Fish Hook
+if [ -d "$HOME/.config/fish" ] || command -v fish >/dev/null 2>&1; then
+    mkdir -p "$HOME/.config/fish"
+    FISH_RC="$HOME/.config/fish/config.fish"
+    if ! grep -q "hey@" "$FISH_RC" 2>/dev/null; then
+        cat << 'EOF' >> "$FISH_RC"
+
+# >>> hey chat hook >>>
+fish_add_path ~/.local/bin
+function __fish_command_not_found_handler --on-event fish_command_not_found
+    if string match -r '^hey@(.+)$' -- $argv[1]
+        set target (string replace -r '^hey@' '' -- $argv[1])
+        hey $target
     else
-        printf "zsh: command not found: %s\n" "$1" >&2
-        return 127
-    fi
-}
+        __fish_default_command_not_found_handler $argv
+    end
+end
+# <<< hey chat hook <<<
 EOF
+    fi
 fi
 
-# 2. Configure Bash if ~/.bashrc exists
-if [ -f "$HOME/.bashrc" ] && ! grep -q "command_not_found_handle" "$HOME/.bashrc"; then
-cat << 'EOF' >> "$HOME/.bashrc"
+# Bash Hook
+if [ -f "$HOME/.bashrc" ]; then
+    if ! grep -q "hey@" "$HOME/.bashrc" 2>/dev/null; then
+        cat << 'EOF' >> "$HOME/.bashrc"
 
+# >>> hey chat hook >>>
 export PATH="$HOME/.local/bin:$PATH"
 command_not_found_handle() {
     if [[ "$1" =~ ^hey@(.+)$ ]]; then
@@ -88,7 +86,29 @@ command_not_found_handle() {
         return 127
     fi
 }
+# <<< hey chat hook <<<
 EOF
+    fi
 fi
 
-echo "Installation complete! Restart your terminal and type hey@username"
+# Zsh Hook
+if [ -f "$HOME/.zshrc" ]; then
+    if ! grep -q "hey@" "$HOME/.zshrc" 2>/dev/null; then
+        cat << 'EOF' >> "$HOME/.zshrc"
+
+# >>> hey chat hook >>>
+export PATH="$HOME/.local/bin:$PATH"
+command_not_found_handler() {
+    if [[ "$1" =~ ^hey@(.+)$ ]]; then
+        hey "${match[1]}"
+    else
+        printf "zsh: command not found: %s\n" "$1" >&2
+        return 127
+    fi
+}
+# <<< hey chat hook <<<
+EOF
+    fi
+fi
+
+echo "[4/4] Done! Restart your terminal and type: hey@<username>"
