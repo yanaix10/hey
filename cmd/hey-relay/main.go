@@ -164,13 +164,13 @@ func handleConn(conn net.Conn) {
 		// Signal Alice that Bob's spawned terminal has connected
 		sess.aliceConn.Write([]byte{1})
 
-		// Pipe encrypted bytes transparently between both peers
+		// Pipe raw underlying net.Conn connections directly (no bufio wrappers)
 		go func() {
-			_, _ = io.Copy(sess.aliceConn, reader)
+			_, _ = io.Copy(sess.aliceConn, conn)
 			sess.aliceConn.Close()
 			conn.Close()
 		}()
-		_, _ = io.Copy(conn, sess.aliceReader)
+		_, _ = io.Copy(conn, sess.aliceConn)
 		conn.Close()
 		sess.aliceConn.Close()
 	}

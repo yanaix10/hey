@@ -89,11 +89,13 @@ func StartChat(conn net.Conn, sessionKey []byte) error {
 		}
 	}()
 
-		finalModel, err := p.Run()
+	finalModel, err := p.Run()
 	if err != nil {
+		fmt.Printf("\n[DEBUG] BubbleTea exited with error: %v\n", err)
 		return err
 	}
-	if fm, ok := finalModel.(model); ok && fm.err != nil {
+	if fm, ok := finalModel.(model); ok {
+		fmt.Printf("\n[DEBUG] Chat closed. Network err: %v\n", fm.err)
 		return fm.err
 	}
 	return nil
@@ -140,12 +142,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		default:
 			// Throttle typing indicators to send max once every 2 seconds
-			if time.Since(m.lastSentTyping) > 2*time.Second {
-				m.lastSentTyping = time.Now()
-				ciphertext, _ := auth.Encrypt(m.sessionKey, []byte("TYP:"))
-				encoded := base64.StdEncoding.EncodeToString(ciphertext)
-				m.conn.Write([]byte(encoded + "\n"))
-			}
+			//if time.Since(m.lastSentTyping) > 2*time.Second {
+			//	m.lastSentTyping = time.Now()
+			//	ciphertext, _ := auth.Encrypt(m.sessionKey, []byte("TYP:"))
+				//encoded := base64.StdEncoding.EncodeToString(ciphertext)
+				//m.conn.Write([]byte(encoded + "\n"))
+			//}
 		}
 
 	case typingMsg:
