@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
@@ -10,7 +11,6 @@ import (
 	"net"
 	"os"
 	"strings"
-	"bufio"
 
 	"heychat/internal/auth"
 	"heychat/internal/discovery"
@@ -151,18 +151,26 @@ func completeHostHandshake(peerConn net.Conn, pin string) {
 
 	peerConn.Write([]byte{1})
 	sessionKey := auth.DeriveKey(pin, salt)
+
 	localUser := os.Getenv("USER")
-if localUser == "" { localUser = os.Getenv("USERNAME") }
+	if localUser == "" {
+		localUser = os.Getenv("USERNAME")
+	}
+	if localUser == "" {
+		localUser = "host"
+	}
 
-// Send our username, read peer's username
-peerConn.Write([]byte(localUser + "\n"))
-reader := bufio.NewReader(peerConn)
-peerUser, _ := reader.ReadString('\n')
-peerUser = strings.TrimSpace(peerUser)
-if peerUser == "" { peerUser = "Peer" }
-// --------------------------
+	// Send our username, read peer's username
+	peerConn.Write([]byte(localUser + "\n"))
+	reader := bufio.NewReader(peerConn)
+	peerUser, _ := reader.ReadString('\n')
+	peerUser = strings.TrimSpace(peerUser)
+	if peerUser == "" {
+		peerUser = "Peer"
+	}
+	// --------------------------
 
-	if err := ui.StartChat(peerConn, sessionKey,peerUser); err != nil {
+	if err := ui.StartChat(peerConn, sessionKey, peerUser); err != nil {
 		log.Printf("Chat ended: %v\n", err)
 	}
 }
@@ -207,16 +215,20 @@ func runJoin(targetAddr string) {
 
 	sessionKey := auth.DeriveKey(enteredPIN, salt)
 	localUser := os.Getenv("USER")
-if localUser == "" { localUser = os.Getenv("USERNAME") }
+	if localUser == "" {
+		localUser = os.Getenv("USERNAME")
+	}
 
-reader := bufio.NewReader(conn)
-peerUser, _ := reader.ReadString('\n')
-peerUser = strings.TrimSpace(peerUser)
-if peerUser == "" { peerUser = "Peer" }
+	reader := bufio.NewReader(conn)
+	peerUser, _ := reader.ReadString('\n')
+	peerUser = strings.TrimSpace(peerUser)
+	if peerUser == "" {
+		peerUser = "Peer"
+	}
 
-conn.Write([]byte(localUser + "\n"))
-// --------------------------
-	if err := ui.StartChat(conn, sessionKey ,peerUser); err != nil {
+	conn.Write([]byte(localUser + "\n"))
+	// --------------------------
+	if err := ui.StartChat(conn, sessionKey, peerUser); err != nil {
 		log.Printf("Chat ended: %v\n", err)
 	}
 }
