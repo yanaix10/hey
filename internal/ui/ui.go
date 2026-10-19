@@ -4,7 +4,12 @@ import (
 	"bufio"
 	"encoding/base64"
 	"fmt"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,9 +19,11 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/qeesung/image2ascii/convert"
 )
 
 type msgReceipt string
+type imgReceipt string
 type errMsg error
 type typingMsg struct{}
 type clearTypingMsg struct{}
@@ -27,26 +34,51 @@ type model struct {
 	messages       []string
 	conn           net.Conn
 	sessionKey     []byte
-	peerUsername   string // Dynamic username storage
+	peerUsername   string
 	err            error
 	peerTyping     bool
 	lastSentTyping time.Time
 	lastRecvTyping time.Time
 }
 
+// renderPixelArt converts any image file into colored ANSI block characters
+func renderPixelArt(path string, width int) string {
+	convertOptions := convert.DefaultOptions
+	convertOptions.Ratio = 0.45
+	convertOptions.FixedWidth = width
+	convertOptions.Colored = true
+	converter := convert.NewImageConverter()
+	return converter.ImageFile2ASCIIString(path, &convertOptions)
+}
+
+// resolvePath expands ~ and resolves relative paths
+func resolvePath(path string) string {
+	path = strings.Trim(path, `"'`) // Strip quotes if user dragged-and-dropped
+	if strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, path[2:])
+		}
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	return abs
+}
+
 func StartChat(conn net.Conn, sessionKey []byte, peerUsername string) error {
 	ta := textarea.New()
-	ta.Placeholder = "Type a message..."
+	ta.Placeholder = "Type a message or 'send path/to/image.jpg'..."
 	ta.Focus()
 	ta.Prompt = "┃ "
-	ta.CharLimit = 280
-	ta.SetWidth(60)
+	ta.CharLimit = 1000
+	ta.SetWidth(65)
 	ta.SetHeight(3)
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ta.ShowLineNumbers = false
 
-	vp := viewport.New(60, 15)
-	vp.SetContent("Secure session established. Messages are E2E encrypted.\n")
+	vp := viewport.New(65, 20)
+	vp.SetContent("Secure session established. Messages are E2E encrypted.\nTip: Type 'send <path>' or '$send <path>' to share images inline.\n")
 
 	if peerUsername == "" {
 		peerUsername = "Peer"
@@ -63,6 +95,7 @@ func StartChat(conn net.Conn, sessionKey []byte, peerUsername string) error {
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
 
+	// Background network receiver
 	go func() {
 		reader := bufio.NewReader(conn)
 		for {
@@ -91,17 +124,17 @@ func StartChat(conn net.Conn, sessionKey []byte, peerUsername string) error {
 				p.Send(typingMsg{})
 			} else if strings.HasPrefix(plaintext, "MSG:") {
 				p.Send(msgReceipt(plaintext[4:]))
+			} else if strings.HasPrefix(plaintext, "IMG:") {
+				p.Send(imgReceipt(plaintext[4:]))
 			}
 		}
 	}()
 
 	finalModel, err := p.Run()
 	if err != nil {
-		fmt.Printf("\n[DEBUG] BubbleTea exited with error: %v\n", err)
 		return err
 	}
 	if fm, ok := finalModel.(model); ok {
-		fmt.Printf("\n[DEBUG] Chat closed. Network err: %v\n", fm.err)
 		return fm.err
 	}
 	return nil
@@ -130,21 +163,74 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case tea.KeyEnter:
-			v := m.textarea.Value()
-			if strings.TrimSpace(v) != "" {
-				style := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
-				displayStr := style.Render("You: ") + v
-				m.messages = append(m.messages, displayStr)
+			raw := strings.TrimSpace(m.textarea.Value())
+			if raw == "" {
+				return m, nil
+			}
+
+			// Normalize syntax: support both "send <path>" and "$send <path>"
+			cmdText := strings.TrimPrefix(raw, "$")
+
+			if strings.HasPrefix(cmdText, "send ") {
+				rawPath := strings.TrimSpace(strings.TrimPrefix(cmdText, "send "))
+				resolvedPath := resolvePath(rawPath)
+
+				// Verify file and decode as image
+				fileData, err := os.ReadFile(resolvedPath)
+				if err != nil {
+					errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+					m.messages = append(m.messages, errStyle.Render("Error reading file: ")+err.Error())
+				} else {
+					f, err := os.Open(resolvedPath)
+					if err != nil {
+						errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+						m.messages = append(m.messages, errStyle.Render("Error opening file: ")+err.Error())
+					} else {
+						_, _, decodeErr := image.DecodeConfig(f)
+						f.Close()
+
+						if decodeErr != nil {
+							errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+							m.messages = append(m.messages, errStyle.Render("Unsupported image format: ")+decodeErr.Error())
+						} else {
+							// 1. Send encrypted payload: IMG:<filename>:<base64>
+							filename := filepath.Base(resolvedPath)
+							b64Data := base64.StdEncoding.EncodeToString(fileData)
+							payload := fmt.Sprintf("IMG:%s:%s", filename, b64Data)
+
+							ciphertext, _ := auth.Encrypt(m.sessionKey, []byte(payload))
+							encodedCipher := base64.StdEncoding.EncodeToString(ciphertext)
+							m.conn.Write([]byte(encodedCipher + "\n"))
+
+							// 2. Render pixelated preview locally in sender's viewport
+							preview := renderPixelArt(resolvedPath, 45)
+							senderStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
+							header := senderStyle.Render("You sent: ") + filename
+							m.messages = append(m.messages, header+"\n"+preview)
+						}
+					}
+				}
+
 				m.viewport.SetContent(strings.Join(m.messages, "\n"))
 				m.textarea.Reset()
 				m.viewport.GotoBottom()
-
-				ciphertext, _ := auth.Encrypt(m.sessionKey, []byte("MSG:"+v))
-				encoded := base64.StdEncoding.EncodeToString(ciphertext)
-				m.conn.Write([]byte(encoded + "\n"))
+				return m, tea.Batch(tiCmd, vpCmd)
 			}
+
+			// Normal text message handling
+			style := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
+			displayStr := style.Render("You: ") + raw
+			m.messages = append(m.messages, displayStr)
+			m.viewport.SetContent(strings.Join(m.messages, "\n"))
+			m.textarea.Reset()
+			m.viewport.GotoBottom()
+
+			ciphertext, _ := auth.Encrypt(m.sessionKey, []byte("MSG:"+raw))
+			encoded := base64.StdEncoding.EncodeToString(ciphertext)
+			m.conn.Write([]byte(encoded + "\n"))
+
 		default:
-			// Throttle typing indicators to send max once every 2 seconds
+			// Throttle typing signals (once every 2s)
 			if time.Since(m.lastSentTyping) > 2*time.Second {
 				m.lastSentTyping = time.Now()
 				ciphertext, _ := auth.Encrypt(m.sessionKey, []byte("TYP:"))
@@ -173,6 +259,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.SetContent(strings.Join(m.messages, "\n"))
 		m.viewport.GotoBottom()
 
+	case imgReceipt:
+		m.peerTyping = false
+		rawPayload := string(msg)
+		parts := strings.SplitN(rawPayload, ":", 2)
+		if len(parts) == 2 {
+			filename := parts[0]
+			b64Data := parts[1]
+			imgBytes, err := base64.StdEncoding.DecodeString(b64Data)
+			if err == nil {
+				// 1. Save to OS temp folder
+				tempFile, err := os.CreateTemp("", "hey-*_"+filename)
+				if err == nil {
+					tempPath := tempFile.Name()
+					tempFile.Write(imgBytes)
+					tempFile.Close()
+
+					// 2. Generate the pixelated terminal art
+					pixelArt := renderPixelArt(tempPath, 45)
+
+					// 3. Clickable OSC 8 link to open original high-res image
+					link := fmt.Sprintf("\033]8;;file://%s\033\\👉 [Ctrl+Click to open full %s]\033]8;;\033\\", tempPath, filename)
+
+					peerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
+					header := peerStyle.Render(m.peerUsername+": sent an image (") + filename + ")"
+					m.messages = append(m.messages, header+"\n"+pixelArt+"\n"+link)
+
+					m.viewport.SetContent(strings.Join(m.messages, "\n"))
+					m.viewport.GotoBottom()
+				}
+			}
+		}
+
 	case errMsg:
 		m.err = msg
 		return m, tea.Quit
@@ -184,7 +302,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) View() string {
 	typingIndicator := "\n"
 	if m.peerTyping {
-		// Dynamically uses the peer's actual name in the typing indicator
 		typingIndicator = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Render(m.peerUsername + " is typing...\n")
 	}
 

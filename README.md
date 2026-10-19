@@ -160,3 +160,5 @@ When new changes are pushed to the repository, pull and re-run the installer:
 
 * **Linux:** `git pull && ./install.sh`
 * **Windows:** `git pull; .\install.ps1`
+  
+
