@@ -185,7 +185,7 @@ func (m model) View() string {
 	typingIndicator := "\n"
 	if m.peerTyping {
 		// Dynamically uses the peer's actual name in the typing indicator
-		typingIndicator = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(m.peerUsername + " is typing...\n")
+		typingIndicator = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Render(m.peerUsername + " is typing...\n")
 	}
 
 	return fmt.Sprintf(
