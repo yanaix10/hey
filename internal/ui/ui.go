@@ -133,7 +133,7 @@ func StartChat(conn net.Conn, sessionKey []byte, peerUsername string) error {
 		peerUsername: peerUsername,
 	}
 
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion()) // <-- Add mouse support here
 
 	go func() {
 		reader := bufio.NewReader(conn)
@@ -193,6 +193,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.viewport, vpCmd = m.viewport.Update(msg)
 
 	switch msg := msg.(type) {
+
+	case tea.WindowSizeMsg:
+		verticalMarginHeight := 5 // Space for textarea and typing indicator
+		
+		m.viewport.Width = msg.Width
+		m.viewport.Height = msg.Height - verticalMarginHeight
+		m.textarea.SetWidth(msg.Width)
+		
+		// Force the viewport to stay scrolled to the bottom on resize
+		m.viewport.GotoBottom()
+		return m, tea.Batch(tiCmd, vpCmd)
+		
 	case tea.KeyMsg:
 		switch msg.Type {
 		case tea.KeyCtrlC:
