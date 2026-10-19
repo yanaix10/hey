@@ -160,18 +160,17 @@ func handleConn(conn net.Conn) {
 			conn.Close()
 			return
 		}
-
 		// Signal Alice that Bob's spawned terminal has connected
-		sess.aliceConn.Write([]byte{1})
+        sess.aliceConn.Write([]byte{1})
 
-		// Pipe raw underlying net.Conn connections directly (no bufio wrappers)
-		go func() {
-			_, _ = io.Copy(sess.aliceConn, conn)
-			sess.aliceConn.Close()
-			conn.Close()
-		}()
-		_, _ = io.Copy(conn, sess.aliceConn)
-		conn.Close()
-		sess.aliceConn.Close()
-	}
+        // Use reader and sess.aliceReader as the source (2nd argument)
+        go func() {
+            _, _ = io.Copy(sess.aliceConn, reader) // <-- changed conn to reader
+            sess.aliceConn.Close()
+            conn.Close()
+        }()
+        _, _ = io.Copy(conn, sess.aliceReader) // <-- changed sess.aliceConn to sess.aliceReader
+        conn.Close()
+        sess.aliceConn.Close()
+    }
 }

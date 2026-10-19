@@ -107,77 +107,71 @@ func (m model) Init() tea.Cmd {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var (
-		tiCmd tea.Cmd
-		vpCmd tea.Cmd
-	)
+    var (
+        tiCmd tea.Cmd
+        vpCmd tea.Cmd
+    )
 
-	m.textarea, tiCmd = m.textarea.Update(msg)
-	m.viewport, vpCmd = m.viewport.Update(msg)
+    switch msg := msg.(type) {
+    case tea.KeyMsg:
+        switch msg.Type {
+        case tea.KeyCtrlC:
+            m.conn.Close()
+            return m, tea.Quit
+        case tea.KeyEsc:
+            return m, nil
+        case tea.KeyEnter:
+            v := strings.TrimSpace(m.textarea.Value())
+            if v != "" {
+                style := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
+                displayStr := style.Render("You: ") + v
+                m.messages = append(m.messages, displayStr)
+                m.viewport.SetContent(strings.Join(m.messages, "\n"))
+                m.textarea.Reset()
+                m.viewport.GotoBottom()
 
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.Type {
-		case tea.KeyCtrlC:
-			m.conn.Close()
-			return m, tea.Quit
-		case tea.KeyEsc:
-			// Do not quit on Esc; ignore escape sequences and keypresses
-			return m, nil
+                ciphertext, err := auth.Encrypt(m.sessionKey, []byte("MSG:"+v))
+                if err == nil {
+                    encoded := base64.StdEncoding.EncodeToString(ciphertext)
+                    if _, err := m.conn.Write([]byte(encoded + "\n")); err != nil {
+                        m.err = err
+                        return m, tea.Quit
+                    }
+                }
+            }
+            return m, nil
+        }
 
-		case tea.KeyEnter:
-			v := m.textarea.Value()
-			if strings.TrimSpace(v) != "" {
-				style := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
-				displayStr := style.Render("You: ") + v
-				m.messages = append(m.messages, displayStr)
-				m.viewport.SetContent(strings.Join(m.messages, "\n"))
-				m.textarea.Reset()
-				m.viewport.GotoBottom()
+    case typingMsg:
+        m.peerTyping = true
+        m.lastRecvTyping = time.Now()
+        return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+            return clearTypingMsg{}
+        })
 
-				// Prefix with MSG:
-				ciphertext, _ := auth.Encrypt(m.sessionKey, []byte("MSG:"+v))
-				encoded := base64.StdEncoding.EncodeToString(ciphertext)
-				m.conn.Write([]byte(encoded + "\n"))
-			}
-		default:
-			// Throttle typing indicators to send max once every 2 seconds
-			//if time.Since(m.lastSentTyping) > 2*time.Second {
-			//	m.lastSentTyping = time.Now()
-			//	ciphertext, _ := auth.Encrypt(m.sessionKey, []byte("TYP:"))
-				//encoded := base64.StdEncoding.EncodeToString(ciphertext)
-				//m.conn.Write([]byte(encoded + "\n"))
-			//}
-		}
+    case clearTypingMsg:
+        if time.Since(m.lastRecvTyping) >= 2*time.Second {
+            m.peerTyping = false
+        }
+        return m, nil
 
-	case typingMsg:
-		m.peerTyping = true
-		m.lastRecvTyping = time.Now()
-		return m, tea.Batch(tiCmd, vpCmd, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
-			return clearTypingMsg{}
-		}))
+    case msgReceipt:
+        m.peerTyping = false
+        style := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
+        displayStr := style.Render("Peer: ") + string(msg)
+        m.messages = append(m.messages, displayStr)
+        m.viewport.SetContent(strings.Join(m.messages, "\n"))
+        m.viewport.GotoBottom()
+        return m, nil
 
-	case clearTypingMsg:
-		// Only clear if 2 seconds have passed since the LAST received typing ping
-		if time.Since(m.lastRecvTyping) >= 2*time.Second {
-			m.peerTyping = false
-		}
+    case errMsg:
+        m.err = msg
+        return m, tea.Quit
+    }
 
-	case msgReceipt:
-		// Clear typing indicator instantly when a message arrives
-		m.peerTyping = false
-		style := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
-		displayStr := style.Render("Peer: ") + string(msg)
-		m.messages = append(m.messages, displayStr)
-		m.viewport.SetContent(strings.Join(m.messages, "\n"))
-		m.viewport.GotoBottom()
-
-	case errMsg:
-		m.err = msg
-		return m, tea.Quit
-	}
-
-	return m, tea.Batch(tiCmd, vpCmd)
+    m.textarea, tiCmd = m.textarea.Update(msg)
+    m.viewport, vpCmd = m.viewport.Update(msg)
+    return m, tea.Batch(tiCmd, vpCmd)
 }
 
 func (m model) View() string {
