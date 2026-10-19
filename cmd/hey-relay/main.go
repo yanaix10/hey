@@ -167,36 +167,38 @@ func handleConn(conn net.Conn) {
 			return
 		}
 
-		// Pipe bytes bidirectionally using safe user-space buffers (avoids Linux kernel splice bug)
+		log.Printf("[BRIDGE %s] Active between Alice (%s) and Bob (%s)", sessionID, sess.aliceConn.RemoteAddr(), conn.RemoteAddr())
+
+		// Pipe bytes bidirectionally using safe user-space buffers
 		var wg sync.WaitGroup
 		wg.Add(2)
 
-		pipe := func(dst net.Conn, src io.Reader) {
+		pipe := func(label string, dst net.Conn, src io.Reader) {
 			defer wg.Done()
 			buf := make([]byte, 32*1024)
 			for {
 				n, err := src.Read(buf)
 				if n > 0 {
 					if _, werr := dst.Write(buf[:n]); werr != nil {
+						log.Printf("[BRIDGE %s] %s write error: %v", sessionID, label, werr)
 						break
 					}
 				}
 				if err != nil {
+					log.Printf("[BRIDGE %s] %s read closed/error: %v", sessionID, label, err)
 					break
 				}
 			}
-			if tc, ok := dst.(*net.TCPConn); ok {
-				_ = tc.CloseWrite()
-			}
 		}
 
-		go pipe(sess.aliceConn, reader)
-		go pipe(conn, sess.aliceReader)
+		go pipe("Bob->Alice", sess.aliceConn, reader)
+		go pipe("Alice->Bob", conn, sess.aliceReader)
 
 		go func() {
 			wg.Wait()
 			conn.Close()
 			sess.aliceConn.Close()
+			log.Printf("[BRIDGE %s] Terminated", sessionID)
 		}()
 	}
 }
