@@ -44,8 +44,9 @@ func SpawnTerminal(chatTarget string) {
 		}
 	}
 
-	psScript := fmt.Sprintf("& '%s' join '%s'; Read-Host 'Press Enter to exit'", heyBin, chatTarget)
+	// Added explicit error catching and -NoExit so the window stays open to show crashes
+	psScript := fmt.Sprintf("try { & '%s' join '%s' } catch { $_; Read-Host 'Error occurred. Press Enter to exit' }", heyBin, chatTarget)
+	
 	cmd := exec.Command("cmd.exe", "/c", "start", "Hey Chat", "powershell.exe", "-NoLogo", "-NoExit", "-Command", psScript)
-
 	_ = cmd.Start()
 }
