@@ -151,8 +151,18 @@ func completeHostHandshake(peerConn net.Conn, pin string) {
 
 	peerConn.Write([]byte{1})
 	sessionKey := auth.DeriveKey(pin, salt)
+	localUser := os.Getenv("USER")
+if localUser == "" { localUser = os.Getenv("USERNAME") }
 
-	if err := ui.StartChat(peerConn, sessionKey); err != nil {
+// Send our username, read peer's username
+peerConn.Write([]byte(localUser + "\n"))
+reader := bufio.NewReader(peerConn)
+peerUser, _ := reader.ReadString('\n')
+peerUser = strings.TrimSpace(peerUser)
+if peerUser == "" { peerUser = "Peer" }
+// --------------------------
+
+	if err := ui.StartChat(peerConn, sessionKey,peerUser); err != nil {
 		log.Printf("Chat ended: %v\n", err)
 	}
 }
@@ -196,7 +206,17 @@ func runJoin(targetAddr string) {
 	}
 
 	sessionKey := auth.DeriveKey(enteredPIN, salt)
-	if err := ui.StartChat(conn, sessionKey); err != nil {
+	localUser := os.Getenv("USER")
+if localUser == "" { localUser = os.Getenv("USERNAME") }
+
+reader := bufio.NewReader(conn)
+peerUser, _ := reader.ReadString('\n')
+peerUser = strings.TrimSpace(peerUser)
+if peerUser == "" { peerUser = "Peer" }
+
+conn.Write([]byte(localUser + "\n"))
+// --------------------------
+	if err := ui.StartChat(conn, sessionKey ,peerUser); err != nil {
 		log.Printf("Chat ended: %v\n", err)
 	}
 }

@@ -28,6 +28,7 @@ type model struct {
 	messages       []string
 	conn           net.Conn
 	sessionKey     []byte
+	peerUsername   string
 	err            error
 	peerTyping     bool
 	lastSentTyping time.Time
@@ -35,7 +36,7 @@ type model struct {
 	writeMu        *sync.Mutex // Store as a pointer to prevent copylocks warning
 }
 
-func StartChat(conn net.Conn, sessionKey []byte) error {
+func StartChat(conn net.Conn, sessionKey []byte , peerUsername string) error {
 	ta := textarea.New()
 	ta.Placeholder = "Type a message..."
 	ta.Focus()
@@ -56,6 +57,7 @@ func StartChat(conn net.Conn, sessionKey []byte) error {
 		conn:       conn,
 		sessionKey: sessionKey,
 		writeMu:    &sync.Mutex{}, // Initialize the pointer
+		peerUsername: peerUsername, 
 	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
@@ -165,7 +167,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case msgReceipt:
 		m.peerTyping = false
 		style := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
-		displayStr := style.Render("Peer: ") + string(msg)
+
+		
+		displayStr := style.Render(m.peerUsername+": ") + string(msg)
 		m.messages = append(m.messages, displayStr)
 		m.viewport.SetContent(strings.Join(m.messages, "\n"))
 		m.viewport.GotoBottom()
