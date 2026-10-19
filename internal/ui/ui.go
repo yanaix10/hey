@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"image"
+	"image/color"
 	_ "image/jpeg"
 	_ "image/png"
 	"net"
@@ -19,7 +20,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/qeesung/image2ascii/convert"
+	"github.com/nfnt/resize"
 )
 
 type msgReceipt string
@@ -41,14 +42,53 @@ type model struct {
 	lastRecvTyping time.Time
 }
 
-// renderPixelArt converts any image file into colored ANSI block characters
+// renderPixelArt converts an image to high-quality ANSI half-blocks
 func renderPixelArt(path string, width int) string {
-	convertOptions := convert.DefaultOptions
-	convertOptions.Ratio = 0.45
-	convertOptions.FixedWidth = width
-	convertOptions.Colored = true
-	converter := convert.NewImageConverter()
-	return converter.ImageFile2ASCIIString(path, &convertOptions)
+	f, err := os.Open(path)
+	if err != nil {
+		return "[Error opening image]"
+	}
+	defer f.Close()
+
+	img, _, err := image.Decode(f)
+	if err != nil {
+		return "[Error decoding image]"
+	}
+
+	bounds := img.Bounds()
+	origW := float64(bounds.Dx())
+	origH := float64(bounds.Dy())
+	
+	targetH := uint((origH / origW) * float64(width))
+
+	resizedImg := resize.Resize(uint(width), targetH, img, resize.Lanczos3)
+	resBounds := resizedImg.Bounds()
+
+	var sb strings.Builder
+	for y := resBounds.Min.Y; y < resBounds.Max.Y; y += 2 {
+		for x := resBounds.Min.X; x < resBounds.Max.X; x++ {
+			top := resizedImg.At(x, y)
+			var bot color.Color = color.Transparent
+			
+			if y+1 < resBounds.Max.Y {
+				bot = resizedImg.At(x, y+1)
+			}
+
+			tr, tg, tb, _ := top.RGBA()
+			br, bg, bb, _ := bot.RGBA()
+
+			topHex := fmt.Sprintf("#%02x%02x%02x", uint8(tr>>8), uint8(tg>>8), uint8(tb>>8))
+			botHex := fmt.Sprintf("#%02x%02x%02x", uint8(br>>8), uint8(bg>>8), uint8(bb>>8))
+
+			style := lipgloss.NewStyle().
+				Foreground(lipgloss.Color(topHex)).
+				Background(lipgloss.Color(botHex))
+
+			sb.WriteString(style.Render("▀"))
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
 }
 
 // resolvePath expands ~ and resolves relative paths
@@ -95,7 +135,6 @@ func StartChat(conn net.Conn, sessionKey []byte, peerUsername string) error {
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
 
-	// Background network receiver
 	go func() {
 		reader := bufio.NewReader(conn)
 		for {
@@ -168,14 +207,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-			// Normalize syntax: support both "send <path>" and "$send <path>"
 			cmdText := strings.TrimPrefix(raw, "$")
 
 			if strings.HasPrefix(cmdText, "send ") {
 				rawPath := strings.TrimSpace(strings.TrimPrefix(cmdText, "send "))
 				resolvedPath := resolvePath(rawPath)
 
-				// Verify file and decode as image
 				fileData, err := os.ReadFile(resolvedPath)
 				if err != nil {
 					errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
@@ -193,7 +230,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
 							m.messages = append(m.messages, errStyle.Render("Unsupported image format: ")+decodeErr.Error())
 						} else {
-							// 1. Send encrypted payload: IMG:<filename>:<base64>
 							filename := filepath.Base(resolvedPath)
 							b64Data := base64.StdEncoding.EncodeToString(fileData)
 							payload := fmt.Sprintf("IMG:%s:%s", filename, b64Data)
@@ -202,11 +238,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							encodedCipher := base64.StdEncoding.EncodeToString(ciphertext)
 							m.conn.Write([]byte(encodedCipher + "\n"))
 
-							// 2. Render pixelated preview locally in sender's viewport
-							preview := renderPixelArt(resolvedPath, 45)
+							preview := renderPixelArt(resolvedPath, 50)
 							senderStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
 							header := senderStyle.Render("You sent: ") + filename
-							m.messages = append(m.messages, header+"\n"+preview)
+							link := "📂 " + resolvedPath + " (Ctrl+Click path to open)"
+							m.messages = append(m.messages, header+"\n"+preview+"\n"+link)
 						}
 					}
 				}
@@ -217,7 +253,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(tiCmd, vpCmd)
 			}
 
-			// Normal text message handling
 			style := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
 			displayStr := style.Render("You: ") + raw
 			m.messages = append(m.messages, displayStr)
@@ -230,7 +265,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.conn.Write([]byte(encoded + "\n"))
 
 		default:
-			// Throttle typing signals (once every 2s)
 			if time.Since(m.lastSentTyping) > 2*time.Second {
 				m.lastSentTyping = time.Now()
 				ciphertext, _ := auth.Encrypt(m.sessionKey, []byte("TYP:"))
@@ -268,18 +302,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			b64Data := parts[1]
 			imgBytes, err := base64.StdEncoding.DecodeString(b64Data)
 			if err == nil {
-				// 1. Save to OS temp folder
 				tempFile, err := os.CreateTemp("", "hey-*_"+filename)
 				if err == nil {
 					tempPath := tempFile.Name()
 					tempFile.Write(imgBytes)
 					tempFile.Close()
 
-					// 2. Generate the pixelated terminal art
-					pixelArt := renderPixelArt(tempPath, 45)
-
-					// 3. Clickable OSC 8 link to open original high-res image
-					link := fmt.Sprintf("\033]8;;file://%s\033\\👉 [Ctrl+Click to open full %s]\033]8;;\033\\", tempPath, filename)
+					pixelArt := renderPixelArt(tempPath, 50)
+					link := "💾 " + tempPath + " (Ctrl+Click path to open)"
 
 					peerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
 					header := peerStyle.Render(m.peerUsername+": sent an image (") + filename + ")"
