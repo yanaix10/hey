@@ -49,6 +49,10 @@ type chatModel struct {
 	recordFile  string
 	voiceCount  int
 	lastVoiceID string
+
+	playingID    string
+	playStart    time.Time
+	playDuration int
 }
 
 func StartChat(conn net.Conn, sessionKey []byte, peerUser string) error {
@@ -123,7 +127,7 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.viewport.Width = msg.Width
-		m.viewport.Height = msg.Height - 5
+		m.viewport.Height = msg.Height - 6
 		m.textInput.Width = msg.Width - 4
 		m.refreshViewport()
 		return m, nil
@@ -131,6 +135,9 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		if m.recording && time.Since(m.recordStart) >= MaxRecordSeconds*time.Second {
 			m.finishAndSendVoice()
+		}
+		if m.playingID != "" && int(time.Since(m.playStart).Seconds()) >= m.playDuration {
+			m.playingID = ""
 		}
 		m.purgeExpiredMessages()
 		return m, tickEverySecond()
@@ -154,15 +161,22 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.lastVoiceID = seqID
 
-				if _, err := SaveVoiceNote(seqID, b64Audio); err == nil {
-					_ = PlayVoiceNoteByID(seqID)
-					m.addMessage(seqID, m.peerUser, fmt.Sprintf("🔊 [Voice Note #%s] (Type '/play %s' or '/delete %s')", seqID, seqID, seqID))
+				if dur, err := SaveVoiceNote(seqID, b64Audio); err == nil {
+					if playDur, err := PlayVoiceNoteByID(seqID); err == nil {
+						m.playingID = seqID
+						m.playStart = time.Now()
+						m.playDuration = playDur
+					}
+					m.addMessage(seqID, m.peerUser, fmt.Sprintf("🔊 [Voice Note #%s (%02ds)] (Type '/play %s' or '/delete %s')", seqID, dur, seqID, seqID))
 				}
 			}
 
 		case strings.HasPrefix(raw, "RECALL|"):
 			seqID := strings.TrimPrefix(raw, "RECALL|")
 			DeleteVoiceNote(seqID)
+			if m.playingID == seqID {
+				m.playingID = ""
+			}
 			m.markDeleted(seqID)
 		}
 		return m, nil
@@ -247,8 +261,12 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				if targetID == "" {
 					m.addMessage("", "System", "No voice note to play. Usage: /play 1")
-				} else if err := PlayVoiceNoteByID(targetID); err != nil {
+				} else if dur, err := PlayVoiceNoteByID(targetID); err != nil {
 					m.addMessage("", "System", err.Error())
+				} else {
+					m.playingID = targetID
+					m.playStart = time.Now()
+					m.playDuration = dur
 				}
 				return m, nil
 			}
@@ -266,6 +284,9 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					_ = sendPacket(m.conn, m.gcm, "RECALL|"+targetID)
 					DeleteVoiceNote(targetID)
+					if m.playingID == targetID {
+						m.playingID = ""
+					}
 					m.markDeleted(targetID)
 				}
 				return m, nil
@@ -291,7 +312,7 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *chatModel) finishAndSendVoice() {
-	b64, err := StopRecording(m.recordCmd, m.recordFile)
+	b64, dur, err := StopRecording(m.recordCmd, m.recordFile)
 	m.recording = false
 	if err != nil {
 		m.addMessage("", "System", "Failed to capture audio: "+err.Error())
@@ -304,7 +325,7 @@ func (m *chatModel) finishAndSendVoice() {
 	if err := sendPacket(m.conn, m.gcm, "VOICE|"+seqID+"|"+b64); err == nil {
 		_, _ = SaveVoiceNote(seqID, b64)
 		m.lastVoiceID = seqID
-		m.addMessage(seqID, "You", fmt.Sprintf("🎙️ [Voice Note #%s] (Type '/play %s' or '/delete %s')", seqID, seqID, seqID))
+		m.addMessage(seqID, "You", fmt.Sprintf("🎙️ [Voice Note #%s (%02ds)] (Type '/play %s' or '/delete %s')", seqID, dur, seqID, seqID))
 	}
 }
 
@@ -360,13 +381,20 @@ func (m *chatModel) refreshViewport() {
 func (m chatModel) View() string {
 	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
 	recStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
+	playStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
 	permStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
 
 	header := headerStyle.Render(fmt.Sprintf("🔒 Encrypted Chat with %s (Messages & Audio self-destruct in 10m)", m.peerUser))
 
-	typingStatus := ""
-	if time.Since(m.peerTyping) < 2*time.Second {
-		typingStatus = fmt.Sprintf("\n%s is typing...", m.peerUser)
+	statusLine := ""
+	if m.playingID != "" {
+		elapsed := int(time.Since(m.playStart).Seconds())
+		if elapsed > m.playDuration {
+			elapsed = m.playDuration
+		}
+		statusLine = "\n" + playStyle.Render(fmt.Sprintf("[▶️ Playing Voice Note #%s... %02ds / %02ds]", m.playingID, elapsed, m.playDuration))
+	} else if time.Since(m.peerTyping) < 2*time.Second {
+		statusLine = fmt.Sprintf("\n%s is typing...", m.peerUser)
 	}
 
 	var bottomBar string
@@ -379,7 +407,7 @@ func (m chatModel) View() string {
 		bottomBar = "\n" + m.textInput.View()
 	}
 
-	return fmt.Sprintf("%s\n\n%s%s\n%s\n", header, m.viewport.View(), typingStatus, bottomBar)
+	return fmt.Sprintf("%s\n\n%s%s\n%s\n", header, m.viewport.View(), statusLine, bottomBar)
 }
 
 func sendPacket(conn net.Conn, gcm cipher.AEAD, plain string) error {
