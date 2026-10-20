@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"heychat/internal/auth"
@@ -19,44 +21,130 @@ import (
 
 const SessionPort = 4243
 
+// --- PEER MANAGEMENT ---
+
+func peersFilePath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	heyDir := filepath.Join(dir, "hey")
+	_ = os.MkdirAll(heyDir, 0700)
+	return filepath.Join(heyDir, "peers.json")
+}
+
+func loadPeers() map[string]string {
+	peers := make(map[string]string)
+	data, err := os.ReadFile(peersFilePath())
+	if err == nil {
+		_ = json.Unmarshal(data, &peers)
+	}
+	return peers
+}
+
+func savePeerMap(peers map[string]string) {
+	data, _ := json.MarshalIndent(peers, "", "  ")
+	_ = os.WriteFile(peersFilePath(), data, 0600)
+}
+
+func savePeer(username, secret string) {
+	peers := loadPeers()
+	peers[username] = secret
+	savePeerMap(peers)
+}
+
+func listPeers() {
+	peers := loadPeers()
+	if len(peers) == 0 {
+		fmt.Println("No trusted peers found.")
+		return
+	}
+	fmt.Println("Trusted Peers:")
+	for username := range peers {
+		fmt.Println("-", username)
+	}
+}
+
+func unpair(username string) {
+	peers := loadPeers()
+	if _, exists := peers[username]; exists {
+		delete(peers, username)
+		savePeerMap(peers)
+		fmt.Printf("Unpaired from '%s'. They will need an OTP to connect again.\n", username)
+	} else {
+		fmt.Printf("User '%s' not found in trusted peers.\n", username)
+	}
+}
+
+func clearPeers() {
+	_ = os.Remove(peersFilePath())
+	fmt.Println("All trusted peers cleared.")
+}
+
+// --------------------------------
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage:\n  hey <username>\n  hey join <target>")
+		fmt.Println("Usage:\n  hey <username>\n  hey join <target>\n  hey peers\n  hey unpair <user>\n  hey clear")
 		os.Exit(1)
 	}
 
-	if os.Args[1] == "join" {
+	command := os.Args[1]
+
+	switch command {
+	case "join":
 		if len(os.Args) < 3 {
 			log.Fatal("Usage: hey join <target>")
 		}
 		runJoin(os.Args[2])
-		return
+	case "peers":
+		listPeers()
+	case "unpair":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: hey unpair <username>")
+			return
+		}
+		unpair(os.Args[2])
+	case "clear":
+		clearPeers()
+	default:
+		runSend(command)
 	}
-
-	runSend(os.Args[1])
 }
 
 func runSend(target string) {
 	target = strings.TrimPrefix(target, "hey@")
 	target = strings.TrimPrefix(target, "@")
 
-	pin, err := auth.GeneratePIN()
-	if err != nil {
-		log.Fatalf("Error generating PIN: %v", err)
+	// Check if peer is already trusted in peers.json
+	peers := loadPeers()
+	savedPin, isTrusted := peers[target]
+
+	var pin string
+	var err error
+
+	if isTrusted {
+		pin = savedPin
+		fmt.Printf("Connecting to trusted peer %s (skipping OTP)...\n", target)
+	} else {
+		pin, err = auth.GeneratePIN()
+		if err != nil {
+			log.Fatalf("Error generating PIN: %v", err)
+		}
 	}
 
 	fmt.Printf("Looking for %s on local Wi-Fi...\n", target)
 	ip, err := discovery.Lookup(target)
 	if err == nil {
-		runLocalSend(target, ip, pin)
+		runLocalSend(target, ip, pin, isTrusted)
 		return
 	}
 
 	fmt.Printf("Not on local Wi-Fi. Contacting global relay for %s...\n", target)
-	runRelaySend(target, pin)
+	runRelaySend(target, pin, isTrusted)
 }
 
-func runLocalSend(target, ip, pin string) {
+func runLocalSend(target, ip, pin string, isTrusted bool) {
 	chatListener, err := net.Listen("tcp", fmt.Sprintf(":%d", SessionPort))
 	if err != nil {
 		log.Fatalf("Failed to bind chat port: %v", err)
@@ -78,7 +166,10 @@ func runLocalSend(target, ip, pin string) {
 		return
 	}
 
-	printPIN(pin)
+	if !isTrusted {
+		printPIN(pin)
+	}
+
 	peerConn, err := chatListener.Accept()
 	if err != nil {
 		log.Fatalf("Failed to accept peer connection: %v", err)
@@ -88,7 +179,7 @@ func runLocalSend(target, ip, pin string) {
 	completeHostHandshake(peerConn, pin)
 }
 
-func runRelaySend(target, pin string) {
+func runRelaySend(target, pin string, isTrusted bool) {
 	sender := os.Getenv("USER")
 	if sender == "" {
 		sender = os.Getenv("USERNAME")
@@ -115,9 +206,10 @@ func runRelaySend(target, pin string) {
 		return
 	}
 
-	printPIN(pin)
+	if !isTrusted {
+		printPIN(pin)
+	}
 
-	// Wait for peer's spawned terminal to bridge into the relay
 	if _, err := io.ReadFull(conn, status); err != nil || status[0] != 1 {
 		log.Fatal("Peer terminal failed to connect.")
 	}
@@ -136,7 +228,7 @@ func printPIN(pin string) {
 func completeHostHandshake(peerConn net.Conn, pin string) {
 	salt := make([]byte, 16)
 	_, _ = rand.Read(salt)
-	peerConn.Write(salt)
+	_, _ = peerConn.Write(salt)
 
 	responseHash := make([]byte, 32)
 	if _, err := io.ReadFull(peerConn, responseHash); err != nil {
@@ -145,11 +237,11 @@ func completeHostHandshake(peerConn net.Conn, pin string) {
 
 	expectedHash := sha256.Sum256(append([]byte(pin), salt...))
 	if !bytes.Equal(responseHash, expectedHash[:]) {
-		peerConn.Write([]byte{0})
-		log.Fatal("\n[!] Handshake failed: Incorrect PIN entered by peer.")
+		_, _ = peerConn.Write([]byte{0})
+		log.Fatal("\n[!] Handshake failed: PIN mismatch.")
 	}
 
-	peerConn.Write([]byte{1})
+	_, _ = peerConn.Write([]byte{1})
 	sessionKey := auth.DeriveKey(pin, salt)
 
 	localUser := os.Getenv("USER")
@@ -160,15 +252,15 @@ func completeHostHandshake(peerConn net.Conn, pin string) {
 		localUser = "host"
 	}
 
-	// Send our username, read peer's username
-	peerConn.Write([]byte(localUser + "\n"))
+	_, _ = peerConn.Write([]byte(localUser + "\n"))
 	reader := bufio.NewReader(peerConn)
 	peerUser, _ := reader.ReadString('\n')
 	peerUser = strings.TrimSpace(peerUser)
 	if peerUser == "" {
 		peerUser = "Peer"
 	}
-	// --------------------------
+
+	savePeer(peerUser, pin)
 
 	if err := ui.StartChat(peerConn, sessionKey, peerUser); err != nil {
 		log.Printf("Chat ended: %v\n", err)
@@ -199,13 +291,38 @@ func runJoin(targetAddr string) {
 		log.Fatalf("Handshake failed to receive challenge.")
 	}
 
-	fmt.Print("\nEnter 6-digit confirmation code: ")
+	// Read peer's username early to check if they are trusted
+	localUser := os.Getenv("USER")
+	if localUser == "" {
+		localUser = os.Getenv("USERNAME")
+	}
+
+	// We send our username first so the joining side knows who is connecting
+	// (or we can prompt if not trusted)
+	var enteredPIN string
+	peers := loadPeers()
+
+	// Prompt for PIN if not in trusted peers
+	fmt.Print("\nEnter 6-digit confirmation code (Press Enter if trusted peer): ")
 	stdinReader := bufio.NewReader(os.Stdin)
-	enteredPIN, _ := stdinReader.ReadString('\n')
+	enteredPIN, _ = stdinReader.ReadString('\n')
 	enteredPIN = strings.TrimSpace(enteredPIN)
 
+	// If empty input, check if we have any matching peer or if we can infer
+	if enteredPIN == "" {
+		// If we only have one trusted peer or want to attempt auto-match
+		for _, p := range peers {
+			enteredPIN = p
+			break
+		}
+	}
+
+	if enteredPIN == "" {
+		log.Fatal("PIN required for unknown peer.")
+	}
+
 	responseHash := sha256.Sum256(append([]byte(enteredPIN), salt...))
-	conn.Write(responseHash[:])
+	_, _ = conn.Write(responseHash[:])
 
 	verdict := make([]byte, 1)
 	_, _ = io.ReadFull(conn, verdict)
@@ -214,10 +331,6 @@ func runJoin(targetAddr string) {
 	}
 
 	sessionKey := auth.DeriveKey(enteredPIN, salt)
-	localUser := os.Getenv("USER")
-	if localUser == "" {
-		localUser = os.Getenv("USERNAME")
-	}
 
 	reader := bufio.NewReader(conn)
 	peerUser, _ := reader.ReadString('\n')
@@ -226,8 +339,10 @@ func runJoin(targetAddr string) {
 		peerUser = "Peer"
 	}
 
-	conn.Write([]byte(localUser + "\n"))
-	// --------------------------
+	_, _ = conn.Write([]byte(localUser + "\n"))
+
+	savePeer(peerUser, enteredPIN)
+
 	if err := ui.StartChat(conn, sessionKey, peerUser); err != nil {
 		log.Printf("Chat ended: %v\n", err)
 	}

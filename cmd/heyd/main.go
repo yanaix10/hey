@@ -6,61 +6,41 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/signal"
+	"os/exec"
+	"runtime"
 	"strings"
-	"syscall"
 	"time"
 
 	"heychat/internal/discovery"
-	"heychat/internal/notify"
+	"heychat/internal/history"
 )
 
 func main() {
-	username := os.Getenv("USER")
-	if username == "" {
-		username = os.Getenv("USERNAME")
+	user := os.Getenv("USER")
+	if user == "" {
+		user = os.Getenv("USERNAME")
 	}
-	if username == "" {
-		username = "anonymous"
-	}
-
-	server, err := discovery.Register(username)
-	if err != nil {
-		log.Printf("Warning: mDNS failed: %v", err)
-	} else {
-		defer server.Shutdown()
+	if user == "" {
+		user = "peer"
 	}
 
-	// Connect to global relay in the background
-	go maintainRelayConn(username)
-
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", discovery.Port))
-	if err != nil {
-		log.Fatalf("TCP listener failed: %v", err)
-	}
-	defer listener.Close()
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	// 1. Background 10-Minute Garbage Collector (Wipes expired JSON & WAV files)
 	go func() {
-		<-sig
-		if server != nil {
-			server.Shutdown()
+		for {
+			history.GarbageCollectAll()
+			time.Sleep(1 * time.Minute)
 		}
-		os.Exit(0)
 	}()
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			continue
-		}
-		go handleLocalPing(conn)
-	}
+	// 2. Global Relay Listener (Auto-reconnects if the server drops)
+	go runRelayListener(user)
+
+	// 3. Local LAN mDNS Broadcast & Listener
+	go discovery.Advertise(user)
+	runLocalListener()
 }
 
-func maintainRelayConn(username string) {
-	relayAddr := discovery.GetRelayAddr()
+func runRelayListener(user string) {
 	for {
 		conn, err := discovery.DialRelay()
 		if err != nil {
@@ -68,69 +48,133 @@ func maintainRelayConn(username string) {
 			continue
 		}
 
-		fmt.Fprintf(conn, "REGISTER %s\n", username)
-		reader := bufio.NewReader(conn)
+		fmt.Fprintf(conn, "LISTEN %s\n", user)
+		scanner := bufio.NewScanner(conn)
 
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				conn.Close()
-				break
-			}
-			parts := strings.Fields(strings.TrimSpace(line))
-			if len(parts) == 3 && parts[0] == "PING" {
-				go handleRelayPing(relayAddr, parts[1], parts[2])
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			// Expected format from relay: INCOMING <sender> <sessionID>
+			if strings.HasPrefix(line, "INCOMING ") {
+				parts := strings.SplitN(line, " ", 3)
+				if len(parts) == 3 {
+					sender, sessionID := parts[1], parts[2]
+					if promptNativePopup(sender) {
+						conn.Write([]byte{1})
+						spawnTerminal("relay:" + sessionID)
+					} else {
+						conn.Write([]byte{0})
+					}
+				}
 			}
 		}
+		conn.Close()
 		time.Sleep(3 * time.Second)
 	}
 }
 
-func handleRelayPing(_, sessionID, sender string) {
-	accepted := notify.Prompt(sender + " (via Relay)")
-	decisionConn, err := discovery.DialRelay()
+func runLocalListener() {
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", discovery.Port))
 	if err != nil {
-		return
+		log.Fatalf("Failed to bind daemon port %d: %v", discovery.Port, err)
 	}
-	defer decisionConn.Close()
+	defer ln.Close()
 
-	if accepted {
-		fmt.Fprintf(decisionConn, "DECISION %s accepted\n", sessionID)
-		notify.SpawnTerminal("relay:" + sessionID)
-	} else {
-		fmt.Fprintf(decisionConn, "DECISION %s rejected\n", sessionID)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+		go handleLocalRequest(conn)
 	}
 }
 
-func handleLocalPing(conn net.Conn) {
+func handleLocalRequest(conn net.Conn) {
 	defer conn.Close()
 
-	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
-	if err != nil {
-		return
-	}
-	// Normalize IPv4-mapped IPv6 address (e.g. ::ffff:192.168.1.5 -> 192.168.1.5)
-	if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
-		host = ip.To4().String()
-	}
-
 	reader := bufio.NewReader(conn)
-	msg, err := reader.ReadString('\n')
+	line, err := reader.ReadString('\n')
 	if err != nil {
 		return
 	}
+	line = strings.TrimSpace(line)
 
-	chatPort := "4243"
-	parts := strings.Split(strings.TrimSpace(msg), ":")
-	if len(parts) == 2 && parts[0] == "CHAT_PORT" {
-		chatPort = parts[1]
+	if strings.HasPrefix(line, "CHAT_PORT:") {
+		port := strings.TrimPrefix(line, "CHAT_PORT:")
+		hostIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+		targetAddr := net.JoinHostPort(hostIP, port)
+
+		if promptNativePopup(hostIP) {
+			conn.Write([]byte("accepted\n"))
+			spawnTerminal(targetAddr)
+		} else {
+			conn.Write([]byte("declined\n"))
+		}
 	}
+}
 
-	chatTarget := net.JoinHostPort(host, chatPort)
-	if notify.Prompt(host) {
-		conn.Write([]byte("accepted\n"))
-		notify.SpawnTerminal(chatTarget)
-	} else {
-		conn.Write([]byte("rejected\n"))
+// promptNativePopup triggers an OS-native Accept/Decline dialog
+func promptNativePopup(sender string) bool {
+	msg := fmt.Sprintf("Incoming encrypted chat from %s. Accept?", sender)
+
+	switch runtime.GOOS {
+	case "linux":
+		// 1. Try modern dunstify/notify-send action buttons
+		if path, err := exec.LookPath("dunstify"); err == nil {
+			out, err := exec.Command(path, "-A", "yes,Accept", "-A", "no,Decline", "HeyChat", msg).Output()
+			if err == nil {
+				return strings.TrimSpace(string(out)) == "yes"
+			}
+		}
+		// 2. Fallback to Zenity or KDialog modal
+		if path, err := exec.LookPath("zenity"); err == nil {
+			return exec.Command(path, "--question", "--title=HeyChat", "--text="+msg).Run() == nil
+		}
+		if path, err := exec.LookPath("kdialog"); err == nil {
+			return exec.Command(path, "--yesno", msg, "--title", "HeyChat").Run() == nil
+		}
+		// 3. Fallback: notify and auto-spawn terminal so PIN acts as the gatekeeper
+		_ = exec.Command("notify-send", "HeyChat", "Incoming chat from "+sender).Run()
+		return true
+
+	case "darwin":
+		script := fmt.Sprintf(`display dialog %q with title "HeyChat" buttons {"Decline", "Accept"} default button "Accept"`, msg)
+		err := exec.Command("osascript", "-e", script).Run()
+		return err == nil
+
+	case "windows":
+		ps := fmt.Sprintf(`Add-Type -AssemblyName PresentationFramework; [System.Windows.MessageBox]::Show('%s', 'HeyChat', 'YesNo', 'Question')`, msg)
+		out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", ps).Output()
+		return err == nil && strings.TrimSpace(string(out)) == "Yes"
+	}
+	return false
+}
+
+// spawnTerminal launches a new OS terminal window running `hey join <targetAddr>`
+func spawnTerminal(targetAddr string) {
+	switch runtime.GOOS {
+	case "linux":
+		terms := [][]string{
+			{"kitty", "-e", "hey", "join", targetAddr},
+			{"alacritty", "-e", "hey", "join", targetAddr},
+			{"foot", "hey", "join", targetAddr},
+			{"wezterm", "start", "--", "hey", "join", targetAddr},
+			{"gnome-terminal", "--", "hey", "join", targetAddr},
+			{"konsole", "-e", "hey", "join", targetAddr},
+			{"xfce4-terminal", "-x", "hey", "join", targetAddr},
+			{"xterm", "-e", "hey", "join", targetAddr},
+		}
+		for _, args := range terms {
+			if path, err := exec.LookPath(args[0]); err == nil {
+				_ = exec.Command(path, args[1:]...).Start()
+				return
+			}
+		}
+
+	case "darwin":
+		script := fmt.Sprintf(`tell application "Terminal" to do script "~/.local/bin/hey join %s"`, targetAddr)
+		_ = exec.Command("osascript", "-e", script).Start()
+
+	case "windows":
+		_ = exec.Command("cmd", "/c", "start", "powershell", "-NoExit", "-Command", "hey.exe join "+targetAddr).Start()
 	}
 }
