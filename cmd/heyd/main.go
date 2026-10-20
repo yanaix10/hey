@@ -36,7 +36,7 @@ func main() {
 	go runRelayListener(user)
 
 	// 3. Local LAN mDNS Broadcast & Listener
-	go discovery.Advertise(user)
+	
 	runLocalListener()
 }
 
@@ -66,6 +66,9 @@ func runRelayListener(user string) {
 					}
 				}
 			}
+		}
+		if err := scanner.Err(); err != nil {
+			log.Printf("Relay listener error: %v", err)
 		}
 		conn.Close()
 		time.Sleep(3 * time.Second)

@@ -100,7 +100,11 @@ func StartChat(conn net.Conn, sessionKey []byte, peerUser string) error {
 				p.Send(netMsg(plain))
 			}
 		}
-		p.Send(netErrMsg(io.EOF))
+		if err := scanner.Err(); err != nil {
+			p.Send(netErrMsg(err))
+		} else {
+			p.Send(netErrMsg(io.EOF))
+		}
 	}()
 
 	_, err = p.Run()

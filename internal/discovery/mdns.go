@@ -45,6 +45,7 @@ func Register(username string) (*zeroconf.Server, error) {
 	return server, nil
 }
 
+
 func Lookup(targetUser string) (string, error) {
 	resolver, err := zeroconf.NewResolver(nil)
 	if err != nil {
