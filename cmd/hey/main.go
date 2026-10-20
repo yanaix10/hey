@@ -11,8 +11,10 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"heychat/internal/auth"
 	"heychat/internal/discovery"
@@ -84,6 +86,8 @@ func clearPeers() {
 // --------------------------------
 
 func main() {
+	ensureDaemonRunning()
+	
 	if len(os.Args) < 2 {
 		fmt.Println("Usage:\n  hey <username>\n  hey join <target>\n  hey peers\n  hey unpair <user>\n  hey clear")
 		os.Exit(1)
@@ -345,5 +349,25 @@ func runJoin(targetAddr string) {
 
 	if err := ui.StartChat(conn, sessionKey, peerUser); err != nil {
 		log.Printf("Chat ended: %v\n", err)
+	}
+}
+
+func ensureDaemonRunning() {
+	// Check if heyd is already listening on local port 4242
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", discovery.Port), 200*time.Millisecond)
+	if err == nil {
+		conn.Close()
+		return // Already running
+	}
+
+	// Not running — launch heyd silently in the background
+	exe, err := os.Executable()
+	if err == nil {
+		heydPath := filepath.Join(filepath.Dir(exe), "heyd")
+		if _, err := os.Stat(heydPath); err != nil {
+			heydPath = "heyd"
+		}
+		_ = exec.Command(heydPath).Start()
+		time.Sleep(500 * time.Millisecond)
 	}
 }
