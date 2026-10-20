@@ -64,29 +64,26 @@ Restart PowerShell after the script finishes.
 
 ---
 
-## Usage: How Two Users Connect
+## 📖 How to Connect (The Real-World Flow)
 
-### 1. First-Time Connection (One-Time OTP)
-When connecting with someone for the first time:
+Because `hey` is a private, blind-relay chat, there is no public user directory. You connect with friends the same way you share a phone number.
 
-1. **Initiate:** Type `hey@<peer_username>` in your terminal.
-2. **Pop-up Alert:** Your peer receives a native desktop pop-up (`Accept` / `Decline`).
-3. **One-Time OTP Verification:**
-   - Clicking **Accept** opens their terminal and prompts for a **6-digit OTP**.
-   - Share the 6-digit OTP displayed on your screen with your peer.
-   - Once entered, the encrypted session starts and both devices permanently save the pairing locally.
+### 1. The First-Time Pairing (One-Time OTP)
+If you want to connect with a friend you are talking to on Discord, Slack, or WhatsApp:
 
-### 2. Future Connections (Instant Pop-up to Chat)
-Once paired with a user, **you never need an OTP again**:
+1. **Alice** runs `./hey host` in her terminal. The server gives her a one-time OTP: `849201`.
+2. **Alice** messages Bob on Discord: *"My terminal chat OTP is 849201."*
+3. **Bob** runs `./hey pair 849201` in his terminal.
 
-1. Type `hey@<peer_username>` in your terminal.
-2. Your peer clicks **Accept** on the incoming desktop pop-up.
-3. Their terminal opens directly into the live encrypted chat session.
+### 2. Automatic Trust & Username Exchange
+The moment Bob enters the OTP, the encrypted bridge connects them. In the background, the app automatically exchanges their local system usernames and saves them to `peers.json`. **You never need an OTP for this friend again.**
 
-### 3. Exit
-Press `Esc` or `Ctrl+C` at any time to close the chat and wipe transient session keys from memory.
+### 3. Future Chats (Zero OTP & Instant Pop-ups)
+The next day, Bob wants to message Alice again. 
 
----
+* If Bob forgets Alice's username, he types `hey peers` to see his trusted friends list.
+* Bob types `hey@alice` directly in his terminal.
+* Alice immediately gets a native OS desktop notification. She clicks **Accept**, and her terminal opens straight into the chat!
 
 ## Managing Peers & Commands
 
