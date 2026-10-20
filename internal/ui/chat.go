@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,6 +47,7 @@ type chatModel struct {
 	recordStart time.Time
 	recordCmd   *exec.Cmd
 	recordFile  string
+	voiceCount  int
 	lastVoiceID string
 }
 
@@ -60,14 +62,13 @@ func StartChat(conn net.Conn, sessionKey []byte, peerUser string) error {
 	}
 
 	ti := textinput.New()
-	ti.Placeholder = "Type a message, /voice to record (30s max), or /delete..."
+	ti.Placeholder = "Message | /voice | /play <1,2..> | /delete <1,2..>"
 	ti.Focus()
 	ti.CharLimit = 1000
 	ti.Width = 70
 
 	vp := viewport.New(80, 18)
 
-	// Load non-expired messages (< 10 mins old) from disk
 	saved := history.LoadAndClean(peerUser)
 	var msgs []displayMsg
 	for _, s := range saved {
@@ -90,7 +91,6 @@ func StartChat(conn net.Conn, sessionKey []byte, peerUser string) error {
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
 
-	// Background TCP reader (10MB buffer to support 30s WAV voice payloads)
 	go func() {
 		scanner := bufio.NewScanner(conn)
 		scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
@@ -100,11 +100,8 @@ func StartChat(conn net.Conn, sessionKey []byte, peerUser string) error {
 				p.Send(netMsg(plain))
 			}
 		}
-		if err := scanner.Err(); err != nil {
-			p.Send(netErrMsg(err))
-		} else {
-			p.Send(netErrMsg(io.EOF))
-		}
+		_ = scanner.Err()
+		p.Send(netErrMsg(io.EOF))
 	}()
 
 	_, err = p.Run()
@@ -132,11 +129,9 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
-		// 1. Auto-stop and send if recording reaches 30 seconds
 		if m.recording && time.Since(m.recordStart) >= MaxRecordSeconds*time.Second {
 			m.finishAndSendVoice()
 		}
-		// 2. Purge any messages older than 10 minutes from the live screen
 		m.purgeExpiredMessages()
 		return m, tickEverySecond()
 
@@ -153,15 +148,22 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case strings.HasPrefix(raw, "VOICE|"):
 			parts := strings.SplitN(raw, "|", 3)
 			if len(parts) == 3 {
-				msgID, b64Audio := parts[1], parts[2]
-				_, _ = SaveAndPlayVoiceNote(msgID, b64Audio)
-				m.addMessage(msgID, m.peerUser, fmt.Sprintf("🔊 [Voice Note #%s - Playing]", msgID))
+				seqID, b64Audio := parts[1], parts[2]
+				if n, err := strconv.Atoi(seqID); err == nil && n > m.voiceCount {
+					m.voiceCount = n
+				}
+				m.lastVoiceID = seqID
+
+				if _, err := SaveVoiceNote(seqID, b64Audio); err == nil {
+					_ = PlayVoiceNoteByID(seqID)
+					m.addMessage(seqID, m.peerUser, fmt.Sprintf("🔊 [Voice Note #%s] (Type '/play %s' or '/delete %s')", seqID, seqID, seqID))
+				}
 			}
 
 		case strings.HasPrefix(raw, "RECALL|"):
-			msgID := strings.TrimPrefix(raw, "RECALL|")
-			DeleteVoiceNote(msgID)
-			m.markDeleted(msgID)
+			seqID := strings.TrimPrefix(raw, "RECALL|")
+			DeleteVoiceNote(seqID)
+			m.markDeleted(seqID)
 		}
 		return m, nil
 
@@ -192,7 +194,6 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case tea.KeyEnter:
-			// Confirm first-time microphone permission prompt
 			if m.askMicPerm {
 				m.askMicPerm = false
 				cmd, file, err := StartRecording()
@@ -201,11 +202,12 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.recordFile = file
 					m.recording = true
 					m.recordStart = time.Now()
+				} else {
+					m.addMessage("", "System", "Microphone error: "+err.Error())
 				}
 				return m, nil
 			}
 
-			// If currently recording, stop and send voice note
 			if m.recording {
 				m.finishAndSendVoice()
 				return m, nil
@@ -217,7 +219,7 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.textInput.Reset()
 
-			// Handle /voice command
+			// 1. /voice command
 			if text == "/voice" {
 				if CheckFirstTimeMicPermission() {
 					m.askMicPerm = true
@@ -235,20 +237,41 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-			// Handle /delete command
-			if text == "/delete" {
-				if m.lastVoiceID != "" {
-					_ = sendPacket(m.conn, m.gcm, "RECALL|"+m.lastVoiceID)
-					DeleteVoiceNote(m.lastVoiceID)
-					m.markDeleted(m.lastVoiceID)
-					m.lastVoiceID = ""
-				} else {
-					m.addMessage("", "System", "No recent voice note to delete.")
+			// 2. /play or /play <number> command
+			if text == "/play" || strings.HasPrefix(text, "/play ") {
+				targetID := strings.TrimSpace(strings.TrimPrefix(text, "/play"))
+				if targetID == "" {
+					targetID = m.lastVoiceID
+				}
+				targetID = strings.TrimPrefix(targetID, "#")
+
+				if targetID == "" {
+					m.addMessage("", "System", "No voice note to play. Usage: /play 1")
+				} else if err := PlayVoiceNoteByID(targetID); err != nil {
+					m.addMessage("", "System", err.Error())
 				}
 				return m, nil
 			}
 
-			// Send normal text message
+			// 3. /delete or /delete <number> command
+			if text == "/delete" || strings.HasPrefix(text, "/delete ") {
+				targetID := strings.TrimSpace(strings.TrimPrefix(text, "/delete"))
+				if targetID == "" {
+					targetID = m.lastVoiceID
+				}
+				targetID = strings.TrimPrefix(targetID, "#")
+
+				if targetID == "" {
+					m.addMessage("", "System", "Specify a voice note to delete. Usage: /delete 1")
+				} else {
+					_ = sendPacket(m.conn, m.gcm, "RECALL|"+targetID)
+					DeleteVoiceNote(targetID)
+					m.markDeleted(targetID)
+				}
+				return m, nil
+			}
+
+			// 4. Normal text message
 			_ = sendPacket(m.conn, m.gcm, "TEXT|"+text)
 			m.addMessage("", "You", text)
 			return m, nil
@@ -271,14 +294,17 @@ func (m *chatModel) finishAndSendVoice() {
 	b64, err := StopRecording(m.recordCmd, m.recordFile)
 	m.recording = false
 	if err != nil {
-		m.addMessage("", "System", "Failed to capture audio.")
+		m.addMessage("", "System", "Failed to capture audio: "+err.Error())
 		return
 	}
 
-	msgID := fmt.Sprintf("%d", time.Now().Unix()%100000)
-	if err := sendPacket(m.conn, m.gcm, "VOICE|"+msgID+"|"+b64); err == nil {
-		m.lastVoiceID = msgID
-		m.addMessage(msgID, "You", fmt.Sprintf("🎙️ [Voice Note #%s Sent] (Type /delete to unsent)", msgID))
+	m.voiceCount++
+	seqID := strconv.Itoa(m.voiceCount)
+
+	if err := sendPacket(m.conn, m.gcm, "VOICE|"+seqID+"|"+b64); err == nil {
+		_, _ = SaveVoiceNote(seqID, b64)
+		m.lastVoiceID = seqID
+		m.addMessage(seqID, "You", fmt.Sprintf("🎙️ [Voice Note #%s] (Type '/play %s' or '/delete %s')", seqID, seqID, seqID))
 	}
 }
 
@@ -295,10 +321,10 @@ func (m *chatModel) addMessage(id, sender, text string) {
 	m.refreshViewport()
 }
 
-func (m *chatModel) markDeleted(msgID string) {
+func (m *chatModel) markDeleted(seqID string) {
 	for i := range m.messages {
-		if m.messages[i].id == msgID {
-			m.messages[i].text = "🚫 [Voice note deleted]"
+		if m.messages[i].id == seqID {
+			m.messages[i].text = fmt.Sprintf("🚫 [Voice Note #%s deleted]", seqID)
 		}
 	}
 	m.refreshViewport()
@@ -348,7 +374,7 @@ func (m chatModel) View() string {
 		bottomBar = permStyle.Render("\n[🎙️ Permission] HeyChat needs microphone access for voice notes. Press ENTER to allow, or ESC to cancel.")
 	} else if m.recording {
 		elapsed := int(time.Since(m.recordStart).Seconds())
-		bottomBar = recStyle.Render(fmt.Sprintf("\n[🔴 Recording... %02ds / %02ds] Press ENTER to send, ESC to cancel.", elapsed, MaxRecordSeconds))
+		bottomBar = recStyle.Render(fmt.Sprintf("\n[🔴 Recording Voice Note #%d... %02ds / %02ds] Press ENTER to send, ESC to cancel.", m.voiceCount+1, elapsed, MaxRecordSeconds))
 	} else {
 		bottomBar = "\n" + m.textInput.View()
 	}

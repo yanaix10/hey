@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"time"
 )
 
 const MaxRecordSeconds = 30
@@ -22,8 +21,6 @@ func voiceHistoryDir() string {
 	return path
 }
 
-// CheckFirstTimeMicPermission returns true on the very first recording attempt
-// and creates a marker file so the prompt only happens once.
 func CheckFirstTimeMicPermission() bool {
 	dir, err := os.UserConfigDir()
 	if err != nil {
@@ -40,7 +37,7 @@ func CheckFirstTimeMicPermission() bool {
 	return false
 }
 
-// StartRecording starts the OS native mic tool (capped at 30s) and returns the command and temp file path.
+// StartRecording detects the available OS audio backend and begins recording a 16kHz mono WAV.
 func StartRecording() (*exec.Cmd, string, error) {
 	file, err := os.CreateTemp("", "hey_voice_*.wav")
 	if err != nil {
@@ -52,11 +49,23 @@ func StartRecording() (*exec.Cmd, string, error) {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "linux":
-		// 16kHz, 16-bit mono WAV, max 30 seconds
-		cmd = exec.Command("arecord", "-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-d", "30", "-t", "wav", filePath)
+		// Fallback chain: PipeWire -> PulseAudio -> ALSA -> FFmpeg
+		if path, err := exec.LookPath("pw-record"); err == nil {
+			cmd = exec.Command(path, "--format=s16", "--rate=16000", "--channels=1", filePath)
+		} else if path, err := exec.LookPath("parecord"); err == nil {
+			cmd = exec.Command(path, "--file-format=wav", "--format=s16le", "--rate=16000", "--channels=1", filePath)
+		} else if path, err := exec.LookPath("arecord"); err == nil {
+			cmd = exec.Command(path, "-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav", filePath)
+		} else if path, err := exec.LookPath("ffmpeg"); err == nil {
+			cmd = exec.Command(path, "-loglevel", "quiet", "-y", "-f", "pulse", "-i", "default", "-ac", "1", "-ar", "16000", filePath)
+		} else {
+			_ = os.Remove(filePath)
+			return nil, "", fmt.Errorf("no recorder found (install pipewire, pulseaudio, or alsa-utils)")
+		}
+
 	case "darwin":
-		// macOS native AudioToolbox recorder, 16kHz mono WAV, max 30 seconds
 		cmd = exec.Command("afrecord", "-d", "30", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", filePath)
+
 	case "windows":
 		stopFile := filePath + ".stop"
 		psScript := fmt.Sprintf(`
@@ -74,7 +83,9 @@ for ($i = 0; $i -lt 300; $i++) {
 [Win32.Audio]::mciSendString("close hw", $null, 0, [IntPtr]::Zero) | Out-Null
 `, stopFile, filePath)
 		cmd = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psScript)
+
 	default:
+		_ = os.Remove(filePath)
 		return nil, "", fmt.Errorf("unsupported OS: %s", runtime.GOOS)
 	}
 
@@ -94,7 +105,6 @@ func StopRecording(cmd *exec.Cmd, filePath string) (string, error) {
 			_ = cmd.Wait()
 			_ = os.Remove(stopFile)
 		} else {
-			// Send SIGINT so arecord/afrecord finalizes the WAV header before exiting
 			_ = cmd.Process.Signal(os.Interrupt)
 			_ = cmd.Wait()
 		}
@@ -103,14 +113,14 @@ func StopRecording(cmd *exec.Cmd, filePath string) (string, error) {
 	defer os.Remove(filePath)
 
 	data, err := os.ReadFile(filePath)
-	if err != nil || len(data) == 0 {
-		return "", fmt.Errorf("failed to read recorded audio")
+	if err != nil || len(data) <= 44 { // 44 bytes is an empty WAV header
+		return "", fmt.Errorf("recorded audio is empty")
 	}
 
 	return base64.StdEncoding.EncodeToString(data), nil
 }
 
-// CancelRecording immediately kills the recording process and deletes the temp file.
+// CancelRecording kills the recording process and deletes the temp file.
 func CancelRecording(cmd *exec.Cmd, filePath string) {
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
@@ -120,48 +130,65 @@ func CancelRecording(cmd *exec.Cmd, filePath string) {
 	_ = os.Remove(filePath + ".stop")
 }
 
-// SaveAndPlayVoiceNote decodes base64 audio into the history folder (for 10-min auto-cleanup) and plays it.
-func SaveAndPlayVoiceNote(msgID, base64Audio string) (string, error) {
+// GetVoiceNotePath returns the local file path for a numbered voice note.
+func GetVoiceNotePath(seqID string) string {
+	return filepath.Join(voiceHistoryDir(), "voice_"+seqID+".wav")
+}
+
+// SaveVoiceNote saves base64 audio to the history folder so it can be played or replayed.
+func SaveVoiceNote(seqID, base64Audio string) (string, error) {
 	rawAudio, err := base64.StdEncoding.DecodeString(base64Audio)
 	if err != nil {
 		return "", err
 	}
-
-	if msgID == "" {
-		msgID = fmt.Sprintf("%d", time.Now().UnixNano())
-	}
-	filePath := filepath.Join(voiceHistoryDir(), "voice_"+msgID+".wav")
-
+	filePath := GetVoiceNotePath(seqID)
 	if err := os.WriteFile(filePath, rawAudio, 0600); err != nil {
 		return "", err
 	}
-
-	PlayAudio(filePath)
 	return filePath, nil
 }
 
-// DeleteVoiceNote removes a saved voice note file from disk (used when /delete is triggered).
-func DeleteVoiceNote(msgID string) {
-	if msgID == "" {
-		return
+// PlayVoiceNoteByID plays a saved voice note by its sequence number (1, 2, 3...).
+func PlayVoiceNoteByID(seqID string) error {
+	filePath := GetVoiceNotePath(seqID)
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return fmt.Errorf("voice note #%s not found or expired", seqID)
 	}
-	filePath := filepath.Join(voiceHistoryDir(), "voice_"+msgID+".wav")
-	_ = os.Remove(filePath)
+	return PlayAudio(filePath)
 }
 
-// PlayAudio plays a .wav file in the background using native OS tools.
-func PlayAudio(filePath string) {
+// DeleteVoiceNote removes a saved voice note file from disk.
+func DeleteVoiceNote(seqID string) {
+	if seqID == "" {
+		return
+	}
+	_ = os.Remove(GetVoiceNotePath(seqID))
+}
+
+// PlayAudio plays a .wav file in the background using the available OS audio player.
+func PlayAudio(filePath string) error {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "linux":
-		cmd = exec.Command("aplay", "-q", filePath)
+		// Fallback chain: PipeWire -> PulseAudio -> ALSA -> FFplay
+		if path, err := exec.LookPath("pw-play"); err == nil {
+			cmd = exec.Command(path, filePath)
+		} else if path, err := exec.LookPath("paplay"); err == nil {
+			cmd = exec.Command(path, filePath)
+		} else if path, err := exec.LookPath("aplay"); err == nil {
+			cmd = exec.Command(path, "-q", filePath)
+		} else if path, err := exec.LookPath("ffplay"); err == nil {
+			cmd = exec.Command(path, "-nodisp", "-autoexit", "-loglevel", "quiet", filePath)
+		} else {
+			return fmt.Errorf("no audio player found (install pipewire, pulseaudio, or alsa-utils)")
+		}
 	case "darwin":
 		cmd = exec.Command("afplay", filePath)
 	case "windows":
 		psPlay := fmt.Sprintf(`(New-Object System.Media.SoundPlayer '%s').PlaySync()`, filePath)
 		cmd = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psPlay)
 	default:
-		return
+		return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
 	}
-	_ = cmd.Start()
+	return cmd.Start()
 }
