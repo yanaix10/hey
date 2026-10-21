@@ -1,14 +1,18 @@
 package ui
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"time"
 )
 
 const MaxRecordSeconds = 30
@@ -39,7 +43,41 @@ func CheckFirstTimeMicPermission() bool {
 	return false
 }
 
-// StartRecording starts the OS native microphone recorder.
+// prepareLinuxAudio unmutes the mic/speakers and finds the physical non-monitor input source.
+func prepareLinuxAudio() string {
+	_ = exec.Command("wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "0").Run()
+	_ = exec.Command("wpctl", "set-volume", "@DEFAULT_AUDIO_SOURCE@", "1.0").Run()
+	_ = exec.Command("wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "0").Run()
+
+	out, err := exec.Command("pactl", "list", "short", "sources").Output()
+	if err != nil {
+		return ""
+	}
+
+	var micSource string
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			name := fields[1]
+			if !strings.HasSuffix(name, ".monitor") {
+				micSource = name
+				if strings.Contains(name, "input") {
+					break
+				}
+			}
+		}
+	}
+
+	if micSource != "" {
+		_ = exec.Command("pactl", "set-default-source", micSource).Run()
+		_ = exec.Command("pactl", "set-source-mute", micSource, "0").Run()
+		_ = exec.Command("pactl", "set-source-volume", micSource, "100%").Run()
+	}
+	_ = exec.Command("pactl", "set-sink-mute", "@DEFAULT_SINK@", "0").Run()
+	return micSource
+}
+
+// StartRecording starts the OS native microphone recorder and waits until it is actively capturing.
 func StartRecording() (*exec.Cmd, string, error) {
 	file, err := os.CreateTemp("", "hey_voice_*.wav")
 	if err != nil {
@@ -47,59 +85,113 @@ func StartRecording() (*exec.Cmd, string, error) {
 	}
 	filePath := file.Name()
 	_ = file.Close()
-	// Remove the 0-byte placeholder so Windows MCI and Linux tools can create it cleanly
 	_ = os.Remove(filePath)
 
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "linux":
-		if path, err := exec.LookPath("parecord"); err == nil {
-			cmd = exec.Command(path, "--file-format=wav", "--format=s16le", "--rate=16000", "--channels=1", filePath)
-		} else if path, err := exec.LookPath("pw-record"); err == nil {
-			cmd = exec.Command(path, "--format=s16", "--rate=16000", "--channels=1", filePath)
+		micSource := prepareLinuxAudio()
+
+		if path, err := exec.LookPath("pw-record"); err == nil {
+			args := []string{"--format=s16", "--rate=16000", "--channels=1"}
+			if micSource != "" {
+				args = append(args, "--target="+micSource)
+			}
+			args = append(args, filePath)
+			cmd = exec.Command(path, args...)
+		} else if path, err := exec.LookPath("parecord"); err == nil {
+			args := []string{"--file-format=wav", "--format=s16le", "--rate=16000", "--channels=1"}
+			if micSource != "" {
+				args = append(args, "-d", micSource)
+			}
+			args = append(args, filePath)
+			cmd = exec.Command(path, args...)
 		} else if path, err := exec.LookPath("arecord"); err == nil {
-			cmd = exec.Command(path, "-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav", filePath)
+			cmd = exec.Command(path, "-q", "-D", "default", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav", filePath)
 		} else if path, err := exec.LookPath("ffmpeg"); err == nil {
-			cmd = exec.Command(path, "-loglevel", "quiet", "-y", "-f", "pulse", "-i", "default", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", filePath)
+			input := "default"
+			if micSource != "" {
+				input = micSource
+			}
+			cmd = exec.Command(path, "-loglevel", "quiet", "-y", "-f", "pulse", "-i", input, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", filePath)
 		} else {
-			return nil, "", fmt.Errorf("no recorder found (install pipewire-pulse or alsa-utils)")
+			return nil, "", fmt.Errorf("no recorder found (install pipewire, pulseaudio, or alsa-utils)")
 		}
+
+		if err := cmd.Start(); err != nil {
+			return nil, "", err
+		}
+		return cmd, filePath, nil
 
 	case "darwin":
 		cmd = exec.Command("afrecord", "-d", "30", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", filePath)
+		if err := cmd.Start(); err != nil {
+			return nil, "", err
+		}
+		return cmd, filePath, nil
 
 	case "windows":
 		stopFile := filePath + ".stop"
 		_ = os.Remove(stopFile)
+		tempDir := filepath.Dir(filePath)
+		baseName := filepath.Base(filePath)
+		dllPath := filepath.Join(tempDir, "hey_winmm_v1.dll")
+
 		psScript := fmt.Sprintf(`
+$dll = '%s'
 $code = '[DllImport("winmm.dll", CharSet = CharSet.Auto)] public static extern int mciSendString(string cmd, System.Text.StringBuilder buf, int len, IntPtr cb);'
-Add-Type -MemberDefinition $code -Name "Audio" -Namespace "Win32"
+if (-not (Test-Path $dll)) {
+    Add-Type -MemberDefinition $code -Name "Audio" -Namespace "Win32" -OutputAssembly $dll
+}
+[Reflection.Assembly]::LoadFrom($dll) | Out-Null
+Set-Location -LiteralPath '%s'
+[Win32.Audio]::mciSendString("close all", $null, 0, [IntPtr]::Zero) | Out-Null
 [Win32.Audio]::mciSendString("open new type waveaudio alias hw", $null, 0, [IntPtr]::Zero) | Out-Null
-[Win32.Audio]::mciSendString("set hw bitspersample 16 channels 1 alignment 2 samplespersec 16000 bytespersec 32000", $null, 0, [IntPtr]::Zero) | Out-Null
+[Win32.Audio]::mciSendString("set hw time format ms", $null, 0, [IntPtr]::Zero) | Out-Null
+[Win32.Audio]::mciSendString("set hw bitspersample 16 channels 1 samplespersec 16000 bytespersec 32000 alignment 2", $null, 0, [IntPtr]::Zero) | Out-Null
 [Win32.Audio]::mciSendString("record hw", $null, 0, [IntPtr]::Zero) | Out-Null
+Write-Output "READY"
 for ($i = 0; $i -lt 300; $i++) {
     if (Test-Path '%s') { break }
     Start-Sleep -Milliseconds 100
 }
 [Win32.Audio]::mciSendString("stop hw", $null, 0, [IntPtr]::Zero) | Out-Null
-[Win32.Audio]::mciSendString('save hw "%s"', $null, 0, [IntPtr]::Zero) | Out-Null
+[Win32.Audio]::mciSendString("save hw %s", $null, 0, [IntPtr]::Zero) | Out-Null
 [Win32.Audio]::mciSendString("close hw", $null, 0, [IntPtr]::Zero) | Out-Null
-`, stopFile, filePath)
+`, dllPath, tempDir, stopFile, baseName)
+
 		cmd = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psScript)
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			return nil, "", err
+		}
+		if err := cmd.Start(); err != nil {
+			return nil, "", err
+		}
+
+		// Wait up to 3 seconds for Windows MCI to finish initializing and start recording
+		readyCh := make(chan bool, 1)
+		go func() {
+			r := bufio.NewReader(stdout)
+			line, _ := r.ReadString('\n')
+			if strings.Contains(line, "READY") {
+				readyCh <- true
+			}
+		}()
+		select {
+		case <-readyCh:
+		case <-time.After(3 * time.Second):
+		}
+
+		return cmd, filePath, nil
 
 	default:
 		return nil, "", fmt.Errorf("unsupported OS: %s", runtime.GOOS)
 	}
-
-	if err := cmd.Start(); err != nil {
-		_ = os.Remove(filePath)
-		return nil, "", err
-	}
-	return cmd, filePath, nil
 }
 
-// StopRecording stops the recorder, normalizes the WAV header to standard PCM, and returns base64 + duration.
-func StopRecording(cmd *exec.Cmd, filePath string) (string, int, error) {
+// StopRecording stops the recorder, normalizes and boosts the WAV audio, and returns base64 + duration + peak%.
+func StopRecording(cmd *exec.Cmd, filePath string) (string, int, int, error) {
 	if cmd != nil && cmd.Process != nil {
 		if runtime.GOOS == "windows" {
 			stopFile := filePath + ".stop"
@@ -116,85 +208,177 @@ func StopRecording(cmd *exec.Cmd, filePath string) (string, int, error) {
 
 	raw, err := os.ReadFile(filePath)
 	if err != nil || len(raw) <= 44 {
-		return "", 0, fmt.Errorf("recorded audio is empty")
+		return "", 0, 0, fmt.Errorf("recorded audio is empty")
 	}
 
-	cleanWav, durationSec, err := normalizeWAV(raw)
+	cleanWav, durationSec, peakPct, err := normalizeWAV(raw)
 	if err != nil {
-		return "", 0, err
+		return "", 0, 0, err
 	}
 
-	return base64.StdEncoding.EncodeToString(cleanWav), durationSec, nil
+	return base64.StdEncoding.EncodeToString(cleanWav), durationSec, peakPct, nil
 }
 
-// normalizeWAV converts extensible or unfinalized WAV headers into a standard 44-byte PCM WAV header.
-func normalizeWAV(raw []byte) ([]byte, int, error) {
+// normalizeWAV converts any WAV/PCM input (8-bit, 16-bit, 32-bit float, or Extensible) into a
+// boosted 16-bit standard PCM WAV file.
+func normalizeWAV(raw []byte) ([]byte, int, int, error) {
+	audioFormat := uint16(1)
 	channels := uint16(1)
 	sampleRate := uint32(16000)
 	bitsPerSample := uint16(16)
-	var pcm []byte
+	var dataBytes []byte
 
 	headerSearchLimit := len(raw)
-	if headerSearchLimit > 512 {
-		headerSearchLimit = 512
+	if headerSearchLimit > 1024 {
+		headerSearchLimit = 1024
 	}
 
 	if bytes.HasPrefix(raw, []byte("RIFF")) {
 		if fmtIdx := bytes.Index(raw[:headerSearchLimit], []byte("fmt ")); fmtIdx != -1 && fmtIdx+24 <= len(raw) {
+			af := binary.LittleEndian.Uint16(raw[fmtIdx+8 : fmtIdx+10])
 			ch := binary.LittleEndian.Uint16(raw[fmtIdx+10 : fmtIdx+12])
 			sr := binary.LittleEndian.Uint32(raw[fmtIdx+12 : fmtIdx+16])
 			bps := binary.LittleEndian.Uint16(raw[fmtIdx+22 : fmtIdx+24])
+
+			if af == 0xFFFE && fmtIdx+34 <= len(raw) {
+				// WAVE_FORMAT_EXTENSIBLE: actual subformat tag is at offset +32
+				af = binary.LittleEndian.Uint16(raw[fmtIdx+32 : fmtIdx+34])
+			}
+			audioFormat = af
 			if ch >= 1 && ch <= 2 {
 				channels = ch
 			}
 			if sr >= 8000 && sr <= 96000 {
 				sampleRate = sr
 			}
-			if bps == 8 || bps == 16 || bps == 24 || bps == 32 {
+			if bps == 8 || bps == 16 || bps == 32 {
 				bitsPerSample = bps
 			}
 		}
 		if dataIdx := bytes.Index(raw[:headerSearchLimit], []byte("data")); dataIdx != -1 && dataIdx+8 <= len(raw) {
-			pcm = raw[dataIdx+8:]
+			dataBytes = raw[dataIdx+8:]
 		} else if len(raw) > 44 {
-			pcm = raw[44:]
+			dataBytes = raw[44:]
 		}
 	} else {
-		pcm = raw
+		dataBytes = raw
 	}
 
-	if len(pcm) < 500 {
-		return nil, 0, fmt.Errorf("recorded audio is empty")
+	if len(dataBytes) < 400 {
+		return nil, 0, 0, fmt.Errorf("recorded audio is too short")
 	}
 
-	byteRate := sampleRate * uint32(channels) * uint32(bitsPerSample/8)
-	blockAlign := channels * (bitsPerSample / 8)
+	// Decode input samples into 16-bit signed mono samples
+	var samples []int16
+	switch {
+	case audioFormat == 3 && bitsPerSample == 32:
+		step := 4 * int(channels)
+		for i := 0; i+step <= len(dataBytes); i += step {
+			f := math.Float32frombits(binary.LittleEndian.Uint32(dataBytes[i : i+4]))
+			if f > 1.0 {
+				f = 1.0
+			} else if f < -1.0 {
+				f = -1.0
+			}
+			samples = append(samples, int16(f*32767))
+		}
+	case bitsPerSample == 8:
+		step := int(channels)
+		for i := 0; i+step <= len(dataBytes); i += step {
+			val := (int16(dataBytes[i]) - 128) * 256
+			samples = append(samples, val)
+		}
+	default:
+		step := 2 * int(channels)
+		for i := 0; i+step <= len(dataBytes); i += step {
+			val := int16(binary.LittleEndian.Uint16(dataBytes[i : i+2]))
+			samples = append(samples, val)
+		}
+	}
 
-	out := make([]byte, 44+len(pcm))
+	if len(samples) == 0 {
+		return nil, 0, 0, fmt.Errorf("no audio samples captured")
+	}
+
+	// 1. Remove DC offset
+	var sum int64
+	for _, s := range samples {
+		sum += int64(s)
+	}
+	dcOffset := int16(sum / int64(len(samples)))
+
+	// 2. Measure peak amplitude
+	var maxAmp int32
+	for i := range samples {
+		adj := int32(samples[i]) - int32(dcOffset)
+		if adj > 32767 {
+			adj = 32767
+		} else if adj < -32768 {
+			adj = -32768
+		}
+		samples[i] = int16(adj)
+		if adj < 0 {
+			adj = -adj
+		}
+		if adj > maxAmp {
+			maxAmp = adj
+		}
+	}
+
+	peakPct := int((maxAmp * 100) / 32767)
+	if peakPct == 0 && maxAmp > 15 {
+		peakPct = 1
+	}
+
+	// 3. Apply auto-gain boost if voice was quiet (up to 16x boost, targeting ~85% volume)
+	if maxAmp > 25 && maxAmp < 24000 {
+		gain := float64(28000) / float64(maxAmp)
+		if gain > 16.0 {
+			gain = 16.0
+		}
+		for i := range samples {
+			boosted := float64(samples[i]) * gain
+			if boosted > 32767 {
+				boosted = 32767
+			} else if boosted < -32768 {
+				boosted = -32768
+			}
+			samples[i] = int16(boosted)
+		}
+	}
+
+	// 4. Encode clean 44-byte 16-bit mono PCM WAV
+	pcmLen := len(samples) * 2
+	byteRate := sampleRate * 2
+	out := make([]byte, 44+pcmLen)
 	copy(out[0:4], "RIFF")
-	binary.LittleEndian.PutUint32(out[4:8], uint32(36+len(pcm)))
+	binary.LittleEndian.PutUint32(out[4:8], uint32(36+pcmLen))
 	copy(out[8:12], "WAVE")
 	copy(out[12:16], "fmt ")
 	binary.LittleEndian.PutUint32(out[16:20], 16)
-	binary.LittleEndian.PutUint16(out[20:22], 1) // Standard PCM format = 1
-	binary.LittleEndian.PutUint16(out[22:24], channels)
+	binary.LittleEndian.PutUint16(out[20:22], 1) // Standard PCM = 1
+	binary.LittleEndian.PutUint16(out[22:24], 1) // Mono = 1 channel
 	binary.LittleEndian.PutUint32(out[24:28], sampleRate)
 	binary.LittleEndian.PutUint32(out[28:32], byteRate)
-	binary.LittleEndian.PutUint16(out[32:34], blockAlign)
-	binary.LittleEndian.PutUint16(out[34:36], bitsPerSample)
+	binary.LittleEndian.PutUint16(out[32:34], 2)  // BlockAlign = 2
+	binary.LittleEndian.PutUint16(out[34:36], 16) // BitsPerSample = 16
 	copy(out[36:40], "data")
-	binary.LittleEndian.PutUint32(out[40:44], uint32(len(pcm)))
-	copy(out[44:], pcm)
+	binary.LittleEndian.PutUint32(out[40:44], uint32(pcmLen))
 
-	durationSec := int((uint32(len(pcm)) + byteRate - 1) / byteRate)
+	offset := 44
+	for _, s := range samples {
+		binary.LittleEndian.PutUint16(out[offset:offset+2], uint16(s))
+		offset += 2
+	}
+
+	durationSec := int((uint32(pcmLen) + byteRate - 1) / byteRate)
 	if durationSec < 1 {
 		durationSec = 1
 	}
 
-	return out, durationSec, nil
+	return out, durationSec, peakPct, nil
 }
 
-// CancelRecording kills the recording process and deletes the temp file.
 func CancelRecording(cmd *exec.Cmd, filePath string) {
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
@@ -208,13 +392,12 @@ func GetVoiceNotePath(seqID string) string {
 	return filepath.Join(voiceHistoryDir(), "voice_"+seqID+".wav")
 }
 
-// SaveVoiceNote normalizes and saves base64 audio to the history folder, returning its duration in seconds.
 func SaveVoiceNote(seqID, base64Audio string) (int, error) {
 	rawAudio, err := base64.StdEncoding.DecodeString(base64Audio)
 	if err != nil {
 		return 0, err
 	}
-	cleanWav, durationSec, err := normalizeWAV(rawAudio)
+	cleanWav, durationSec, _, err := normalizeWAV(rawAudio)
 	if err != nil {
 		return 0, err
 	}
@@ -225,19 +408,16 @@ func SaveVoiceNote(seqID, base64Audio string) (int, error) {
 	return durationSec, nil
 }
 
-// PlayVoiceNoteByID plays a saved voice note and returns its duration in seconds.
-func PlayVoiceNoteByID(seqID string) (int, error) {
+// GetVoiceNoteDuration returns the duration of a saved voice note and verifies it exists.
+func GetVoiceNoteDuration(seqID string) (int, error) {
 	filePath := GetVoiceNotePath(seqID)
 	raw, err := os.ReadFile(filePath)
 	if err != nil {
 		return 0, fmt.Errorf("voice note #%s not found or expired", seqID)
 	}
-	_, durationSec, err := normalizeWAV(raw)
+	_, durationSec, _, err := normalizeWAV(raw)
 	if err != nil {
-		durationSec = 1
-	}
-	if err := PlayAudio(filePath); err != nil {
-		return 0, err
+		return 1, nil
 	}
 	return durationSec, nil
 }
@@ -249,28 +429,43 @@ func DeleteVoiceNote(seqID string) {
 	_ = os.Remove(GetVoiceNotePath(seqID))
 }
 
-func PlayAudio(filePath string) error {
-	var cmd *exec.Cmd
+// PlayAudioSync plays a .wav file synchronously, trying all available OS players until one succeeds.
+func PlayAudioSync(filePath string) error {
 	switch runtime.GOOS {
 	case "linux":
-		if path, err := exec.LookPath("paplay"); err == nil {
-			cmd = exec.Command(path, filePath)
-		} else if path, err := exec.LookPath("pw-play"); err == nil {
-			cmd = exec.Command(path, filePath)
-		} else if path, err := exec.LookPath("aplay"); err == nil {
-			cmd = exec.Command(path, "-q", filePath)
-		} else if path, err := exec.LookPath("ffplay"); err == nil {
-			cmd = exec.Command(path, "-nodisp", "-autoexit", "-loglevel", "quiet", filePath)
-		} else {
-			return fmt.Errorf("no audio player found (install pipewire-pulse or alsa-utils)")
+		_ = exec.Command("wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "0").Run()
+		_ = exec.Command("pactl", "set-sink-mute", "@DEFAULT_SINK@", "0").Run()
+
+		candidates := [][]string{
+			{"pw-play", filePath},
+			{"paplay", filePath},
+			{"aplay", "-D", "default", "-q", filePath},
+			{"aplay", "-q", filePath},
+			{"ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", filePath},
 		}
+		var lastErr error
+		for _, args := range candidates {
+			if path, err := exec.LookPath(args[0]); err == nil {
+				if err := exec.Command(path, args[1:]...).Run(); err == nil {
+					return nil
+				} else {
+					lastErr = err
+				}
+			}
+		}
+		if lastErr != nil {
+			return fmt.Errorf("audio playback failed: %v", lastErr)
+		}
+		return fmt.Errorf("no working audio player found")
+
 	case "darwin":
-		cmd = exec.Command("afplay", filePath)
+		return exec.Command("afplay", filePath).Run()
+
 	case "windows":
 		psPlay := fmt.Sprintf(`(New-Object System.Media.SoundPlayer '%s').PlaySync()`, filePath)
-		cmd = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psPlay)
+		return exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psPlay).Run()
+
 	default:
 		return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
 	}
-	return cmd.Start()
 }

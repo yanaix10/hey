@@ -26,6 +26,11 @@ type netMsg string
 type netErrMsg error
 type tickMsg time.Time
 
+type playDoneMsg struct {
+	seqID string
+	err   error
+}
+
 type displayMsg struct {
 	id        string
 	sender    string
@@ -122,6 +127,14 @@ func tickEverySecond() tea.Cmd {
 	})
 }
 
+func playVoiceCmd(seqID string) tea.Cmd {
+	filePath := GetVoiceNotePath(seqID)
+	return func() tea.Msg {
+		err := PlayAudioSync(filePath)
+		return playDoneMsg{seqID: seqID, err: err}
+	}
+}
+
 func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
@@ -132,12 +145,18 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewport()
 		return m, nil
 
+	case playDoneMsg:
+		if m.playingID == msg.seqID {
+			m.playingID = ""
+		}
+		if msg.err != nil {
+			m.addMessage("", "System", fmt.Sprintf("Playback error (#%s): %v", msg.seqID, msg.err))
+		}
+		return m, nil
+
 	case tickMsg:
 		if m.recording && time.Since(m.recordStart) >= MaxRecordSeconds*time.Second {
 			m.finishAndSendVoice()
-		}
-		if m.playingID != "" && int(time.Since(m.playStart).Seconds()) >= m.playDuration {
-			m.playingID = ""
 		}
 		m.purgeExpiredMessages()
 		return m, tickEverySecond()
@@ -162,12 +181,11 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.lastVoiceID = seqID
 
 				if dur, err := SaveVoiceNote(seqID, b64Audio); err == nil {
-					if playDur, err := PlayVoiceNoteByID(seqID); err == nil {
-						m.playingID = seqID
-						m.playStart = time.Now()
-						m.playDuration = playDur
-					}
+					m.playingID = seqID
+					m.playStart = time.Now()
+					m.playDuration = dur
 					m.addMessage(seqID, m.peerUser, fmt.Sprintf("🔊 [Voice Note #%s (%02ds)] (Type '/play %s' or '/delete %s')", seqID, dur, seqID, seqID))
+					return m, playVoiceCmd(seqID)
 				}
 			}
 
@@ -261,14 +279,17 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				if targetID == "" {
 					m.addMessage("", "System", "No voice note to play. Usage: /play 1")
-				} else if dur, err := PlayVoiceNoteByID(targetID); err != nil {
-					m.addMessage("", "System", err.Error())
-				} else {
-					m.playingID = targetID
-					m.playStart = time.Now()
-					m.playDuration = dur
+					return m, nil
 				}
-				return m, nil
+				dur, err := GetVoiceNoteDuration(targetID)
+				if err != nil {
+					m.addMessage("", "System", err.Error())
+					return m, nil
+				}
+				m.playingID = targetID
+				m.playStart = time.Now()
+				m.playDuration = dur
+				return m, playVoiceCmd(targetID)
 			}
 
 			// 3. /delete or /delete <number> command
@@ -312,10 +333,15 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *chatModel) finishAndSendVoice() {
-	b64, dur, err := StopRecording(m.recordCmd, m.recordFile)
+	b64, dur, peakPct, err := StopRecording(m.recordCmd, m.recordFile)
 	m.recording = false
 	if err != nil {
 		m.addMessage("", "System", "Failed to capture audio: "+err.Error())
+		return
+	}
+
+	if peakPct == 0 {
+		m.addMessage("", "System", "⚠️ Microphone recorded 0% volume (silence). Check your hardware mic mute switch.")
 		return
 	}
 
