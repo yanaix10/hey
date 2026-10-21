@@ -1,104 +1,102 @@
-# hey — Global Encrypted Terminal Chat
+# 💬 hey : Global Encrypted Terminal Chat & Voice Notes App
 
-A cross-platform, end-to-end encrypted terminal chat utility written in Go. Type `hey@username` directly in your shell to send an instant desktop pop-up to any peer globally, pair once with a 6-digit one-time OTP, and chat in an encrypted TUI—clicking the pop-up on future connections drops you straight into the chat.
-
-## Architecture & Features
-
-- **Global Relay Routing (Zero Firewall Setup):** Connects peers across different networks and NATs via a blind TCP relay—no port forwarding, LAN requirement, or local firewall rules needed.
-- **One-Time OTP Pairing:** Verify a new peer once using a 6-digit OTP. Paired credentials and keys are stored locally (`~/.config/hey/peers.json` on Linux/macOS, `%APPDATA%\hey\peers.json` on Windows) so future chats connect immediately upon clicking the pop-up.
-- **End-to-End Encryption:** Uses a 16-byte random salt challenge-response handshake to derive a 256-bit **AES-GCM** session key; the relay server only pipes encrypted bytes and cannot read messages.
-- **Native OS Alerts:** Triggers desktop notifications via D-Bus on Linux, Win32 modal dialogs on Windows, and AppleScript dialogs on macOS.
-- **Interactive TUI:** Built with Bubble Tea, featuring live typing indicators and auto-scrolling viewports.
-- **Automatic Shell Hook Integration:** Intercepts `hey@<username>` directly in Fish, Bash, Zsh, and PowerShell out of the box.
+`hey` is a lightweight, cross-platform terminal chat application written in Go. It allows you to connect securely with anyone globally using a one-time 6-digit OTP, send pixelated inline images, and record/playback ephemeral voice notes.
 
 ---
 
-## Prerequisites
+## Features
+
+- **Global Relay Routing:** Connects peers across different networks and NATs via a lightweight TCP relay—no local firewall rules or port forwarding required.
+- **One-Time OTP Pairing:** Verify a new peer once using a 6-digit code. Paired credentials are saved locally (`~/.config/hey/peers.json` on Linux/macOS, `%APPDATA%\hey\peers.json` on Windows) so future chats connect instantly.
+- **End-to-End Encryption:** Uses AES-GCM encryption derived from a secure cryptographic handshake; the relay server only blind-pipes encrypted bytes and cannot read your messages.
+- **Ephemeral 10-Minute Self-Destruct:** All text messages, images, and voice notes automatically self-destruct from local storage after 10 minutes.
+- **Voice Notes & Instant Recall:** Record up to 30-second voice notes with `/voice`, playback using `/play`, and instantly delete/recall them from both screens using `/delete`.
+- **Native Desktop Pop-ups:** Triggers OS-native notifications on Linux (D-Bus), Windows, and macOS, bringing you straight into the chat when clicked.
+- **Automatic Shell Hooks:** Intercepts `hey@<username>` directly out of the box in Fish, Bash, Zsh, and PowerShell.
+
+---
+
+##  Prerequisites
 
 - **Go 1.21+** installed (`go version`)
-- **Git**
+- **Git** installed
 
 ---
 
-## Out-of-the-Box Setup Guides
+##  Out-of-the-Box Installation Guides
 
 ### 1. Linux & macOS (Fish / Zsh / Bash)
-
-The installer compiles `hey` and `heyd`, registers `heyd` as a background user service (`systemd` on Linux, `launchd` on macOS), and automatically adds the `hey@username` hook to your shell config.
-
+Open your terminal and run:
 ```bash
 git clone [https://github.com/yanaix10/hey.git](https://github.com/yanaix10/hey.git)
 cd hey
 chmod +x install.sh
 ./install.sh
 ```
+*(This builds the binaries, moves them to `~/.local/bin`, installs `heyd` as a background user service, and hooks the `hey@username` command into your shell)*[cite: 3].
 
-Reload your shell (or open a new terminal tab) after installation:
-```bash
-# Fish
-source ~/.config/fish/config.fish
-
-# Zsh
-source ~/.zshrc
-
-# Bash
-source ~/.bashrc
-```
-
----
+Reload your shell config[cite: 3]:
+- **Fish:** `source ~/.config/fish/config.fish`[cite: 3]
+- **Zsh:** `source ~/.zshrc`[cite: 3]
+- **Bash:** `source ~/.bashrc`[cite: 3]
 
 ### 2. Windows (PowerShell)
-
-Open PowerShell and run:
-
+Open PowerShell as your user and run[cite: 3]:
 ```powershell
 git clone [https://github.com/yanaix10/hey.git](https://github.com/yanaix10/hey.git)
 cd hey
 Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
 .\install.ps1
 ```
+*(This compiles `hey.exe` and `heyd.exe`, registers the background daemon to run on user login, and injects the `hey@username` hook into your PowerShell profile)*[cite: 4].
 
-*(This compiles `hey.exe` and `heyd.exe`, installs them to `~\.local\bin`, starts the `heyd` background daemon automatically on login, and registers the `hey@username` hook in your PowerShell `$PROFILE`).*
-
-Restart PowerShell after the script finishes.
+Restart your PowerShell window after installation[cite: 4].
 
 ---
 
-## 📖 How to Connect (The Real-World Flow)
+## Usage Guide: How Two Users Connect
 
-Because `hey` is a private, blind-relay chat, there is no public user directory. You connect with friends the same way you share a phone number.
+### 1. First-Time Connection (One-Time OTP)
+When chatting with someone for the very first time[cite: 4]:
+1. **Initiate:** Type `hey@<friend_username>` in your terminal[cite: 4].
+2. **Accept Pop-up:** Your friend receives an OS-native desktop notification and clicks **Accept**[cite: 4].
+3. **Enter OTP:** Your terminal displays a **6-digit OTP**. Tell your friend this code (over Discord, WhatsApp, etc.), and they enter it into their terminal window[cite: 4].
+4. **Paired:** The chat unlocks, and both computers permanently trust each other. **You will never need an OTP for this friend again**[cite: 4].
 
-### 1. The First-Time Pairing (One-Time OTP)
-If you want to connect with a friend you are talking to on Discord, Slack, or WhatsApp:
+### 2. Future Connections (Instant Pop-up & Chat)
+Once paired, starting a chat is instantaneous[cite: 4]:
+1. Type `hey@<friend_username>` in your terminal[cite: 4].
+2. Your friend clicks **Accept** on their incoming desktop notification[cite: 4].
+3. Their terminal opens straight into the encrypted chat session[cite: 4].
 
-1. **Alice** runs `./hey host` in her terminal. The server gives her a one-time OTP: `849201`.
-2. **Alice** messages Bob on Discord: *"My terminal chat OTP is 849201."*
-3. **Bob** runs `./hey pair 849201` in his terminal.
+---
 
-### 2. Automatic Trust & Username Exchange
-The moment Bob enters the OTP, the encrypted bridge connects them. In the background, the app automatically exchanges their local system usernames and saves them to `peers.json`. **You never need an OTP for this friend again.**
+##  Chat Commands & Media Guide
 
-### 3. Future Chats (Zero OTP & Instant Pop-ups)
-The next day, Bob wants to message Alice again. 
+Once you are inside the encrypted terminal chat UI, you can use these commands[cite: 5]:
 
-* If Bob forgets Alice's username, he types `hey peers` to see his trusted friends list.
-* Bob types `hey@alice` directly in his terminal.
-* Alice immediately gets a native OS desktop notification. She clicks **Accept**, and her terminal opens straight into the chat!
+| Command | Action |
+| :--- | :--- |
+| `Type message & Enter` | Send a standard end-to-end encrypted text message[cite: 5] |
+| `send <path/to/image.jpg>` | Render a high-resolution pixel art preview inline and share the file[cite: 5] |
+| `/voice` | Start recording a voice note (max 30 seconds; Press **Enter** to send, **Esc** to cancel)[cite: 5] |
+| `/play` or `/play <number>` | Replay the latest or a specific numbered voice note (e.g., `/play 1`)[cite: 5] |
+| `/delete` or `/delete <number>` | Instantly wipe/recall the latest or a specific voice note from both screens[cite: 5] |
 
-## Managing Peers & Commands
+---
+
+##  Utility Commands
 
 | Command | Description |
 | :--- | :--- |
-| `hey@<username>` | Ring a peer (prompts for one-time OTP on first chat, instant thereafter) |
-| `hey peers` | List all trusted/paired peers saved on your machine |
-| `hey unpair <username>` | Remove a saved peer and require OTP verification again |
-| `hey whoami` | Display your registered username on the relay |
+| `hey peers` | List all trusted/paired friends saved on your machine[cite: 5, 6] |
+| `hey unpair <username>` | Remove a saved friend and require a new OTP verification next time[cite: 5, 6] |
+| `hey clear` | Wipe all saved peer data[cite: 5, 6] |
 
 ---
 
-## Updating
+##  Updating
 
-Pull the latest changes and re-run the installer for your OS:
-
-- **Linux / macOS:** `git pull && ./install.sh`
-- **Windows:** `git pull; .\install.ps1`
+To pull the latest updates and rebuild:
+- **Linux / macOS:** `git pull && ./install.sh`[cite: 6]
+- **Windows:** `git pull; .\install.ps1`[cite: 6]
