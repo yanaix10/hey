@@ -43,7 +43,6 @@ func CheckFirstTimeMicPermission() bool {
 	return false
 }
 
-// prepareLinuxAudio unmutes the mic/speakers and finds the physical non-monitor input source.
 func prepareLinuxAudio() string {
 	_ = exec.Command("wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "0").Run()
 	_ = exec.Command("wpctl", "set-volume", "@DEFAULT_AUDIO_SOURCE@", "1.0").Run()
@@ -133,32 +132,112 @@ func StartRecording() (*exec.Cmd, string, error) {
 	case "windows":
 		stopFile := filePath + ".stop"
 		_ = os.Remove(stopFile)
-		tempDir := filepath.Dir(filePath)
-		baseName := filepath.Base(filePath)
-		dllPath := filepath.Join(tempDir, "hey_winmm_v1.dll")
 
 		psScript := fmt.Sprintf(`
-$dll = '%s'
-$code = '[DllImport("winmm.dll", CharSet = CharSet.Auto)] public static extern int mciSendString(string cmd, System.Text.StringBuilder buf, int len, IntPtr cb);'
-if (-not (Test-Path $dll)) {
-    Add-Type -MemberDefinition $code -Name "Audio" -Namespace "Win32" -OutputAssembly $dll
+$code = @"
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+public class HeyWaveIn {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct WAVEFORMATEX {
+        public ushort wFormatTag;
+        public ushort nChannels;
+        public uint nSamplesPerSec;
+        public uint nAvgBytesPerSec;
+        public ushort nBlockAlign;
+        public ushort wBitsPerSample;
+        public ushort cbSize;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public class WAVEHDR {
+        public IntPtr lpData;
+        public uint dwBufferLength;
+        public uint dwBytesRecorded;
+        public IntPtr dwUser;
+        public uint dwFlags;
+        public uint dwLoops;
+        public IntPtr lpNext;
+        public IntPtr reserved;
+    }
+
+    [DllImport("winmm.dll")]
+    public static extern int waveInOpen(out IntPtr hWaveIn, int uDeviceID, ref WAVEFORMATEX lpFormat, IntPtr dwCallback, IntPtr dwInstance, int dwFlags);
+    [DllImport("winmm.dll")]
+    public static extern int waveInPrepareHeader(IntPtr hWaveIn, IntPtr lpWaveInHdr, int uSize);
+    [DllImport("winmm.dll")]
+    public static extern int waveInAddBuffer(IntPtr hWaveIn, IntPtr lpWaveInHdr, int uSize);
+    [DllImport("winmm.dll")]
+    public static extern int waveInStart(IntPtr hWaveIn);
+    [DllImport("winmm.dll")]
+    public static extern int waveInReset(IntPtr hWaveIn);
+    [DllImport("winmm.dll")]
+    public static extern int waveInUnprepareHeader(IntPtr hWaveIn, IntPtr lpWaveInHdr, int uSize);
+    [DllImport("winmm.dll")]
+    public static extern int waveInClose(IntPtr hWaveIn);
+
+    public static void Record(string outPath, string stopPath) {
+        WAVEFORMATEX fmt = new WAVEFORMATEX();
+        fmt.wFormatTag = 1;
+        fmt.nChannels = 1;
+        fmt.nSamplesPerSec = 16000;
+        fmt.wBitsPerSample = 16;
+        fmt.nBlockAlign = 2;
+        fmt.nAvgBytesPerSec = 32000;
+        fmt.cbSize = 0;
+
+        IntPtr hWaveIn;
+        int res = waveInOpen(out hWaveIn, -1, ref fmt, IntPtr.Zero, IntPtr.Zero, 0);
+        if (res != 0) {
+            Console.WriteLine("ERR:waveInOpen:" + res);
+            Console.Out.Flush();
+            return;
+        }
+
+        byte[] buf = new byte[32000 * 30];
+        GCHandle hBuf = GCHandle.Alloc(buf, GCHandleType.Pinned);
+
+        WAVEHDR hdr = new WAVEHDR();
+        hdr.lpData = hBuf.AddrOfPinnedObject();
+        hdr.dwBufferLength = (uint)buf.Length;
+
+        GCHandle hHdr = GCHandle.Alloc(hdr, GCHandleType.Pinned);
+        IntPtr pHdr = hHdr.AddrOfPinnedObject();
+        int hdrSize = Marshal.SizeOf(typeof(WAVEHDR));
+
+        waveInPrepareHeader(hWaveIn, pHdr, hdrSize);
+        waveInAddBuffer(hWaveIn, pHdr, hdrSize);
+        waveInStart(hWaveIn);
+
+        Console.WriteLine("READY");
+        Console.Out.Flush();
+
+        for (int i = 0; i < 300; i++) {
+            if (File.Exists(stopPath)) break;
+            Thread.Sleep(100);
+        }
+
+        waveInReset(hWaveIn);
+        int recorded = (int)hdr.dwBytesRecorded;
+        waveInUnprepareHeader(hWaveIn, pHdr, hdrSize);
+        hHdr.Free();
+        hBuf.Free();
+        waveInClose(hWaveIn);
+
+        if (recorded > 0) {
+            byte[] outBytes = new byte[recorded];
+            Array.Copy(buf, 0, outBytes, 0, recorded);
+            File.WriteAllBytes(outPath, outBytes);
+        }
+    }
 }
-[Reflection.Assembly]::LoadFrom($dll) | Out-Null
-Set-Location -LiteralPath '%s'
-[Win32.Audio]::mciSendString("close all", $null, 0, [IntPtr]::Zero) | Out-Null
-[Win32.Audio]::mciSendString("open new type waveaudio alias hw", $null, 0, [IntPtr]::Zero) | Out-Null
-[Win32.Audio]::mciSendString("set hw time format ms", $null, 0, [IntPtr]::Zero) | Out-Null
-[Win32.Audio]::mciSendString("set hw bitspersample 16 channels 1 samplespersec 16000 bytespersec 32000 alignment 2", $null, 0, [IntPtr]::Zero) | Out-Null
-[Win32.Audio]::mciSendString("record hw", $null, 0, [IntPtr]::Zero) | Out-Null
-Write-Output "READY"
-for ($i = 0; $i -lt 300; $i++) {
-    if (Test-Path '%s') { break }
-    Start-Sleep -Milliseconds 100
-}
-[Win32.Audio]::mciSendString("stop hw", $null, 0, [IntPtr]::Zero) | Out-Null
-[Win32.Audio]::mciSendString("save hw %s", $null, 0, [IntPtr]::Zero) | Out-Null
-[Win32.Audio]::mciSendString("close hw", $null, 0, [IntPtr]::Zero) | Out-Null
-`, dllPath, tempDir, stopFile, baseName)
+"@
+Add-Type -TypeDefinition $code
+[HeyWaveIn]::Record('%s', '%s')
+`, filePath, stopFile)
 
 		cmd = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psScript)
 		stdout, err := cmd.StdoutPipe()
@@ -169,18 +248,20 @@ for ($i = 0; $i -lt 300; $i++) {
 			return nil, "", err
 		}
 
-		// Wait up to 3 seconds for Windows MCI to finish initializing and start recording
-		readyCh := make(chan bool, 1)
+		statusCh := make(chan string, 1)
 		go func() {
 			r := bufio.NewReader(stdout)
 			line, _ := r.ReadString('\n')
-			if strings.Contains(line, "READY") {
-				readyCh <- true
-			}
+			statusCh <- strings.TrimSpace(line)
 		}()
+
 		select {
-		case <-readyCh:
-		case <-time.After(3 * time.Second):
+		case status := <-statusCh:
+			if strings.HasPrefix(status, "ERR:") {
+				_ = cmd.Process.Kill()
+				return nil, "", fmt.Errorf("windows microphone error (%s) - check Windows Mic Privacy settings", status)
+			}
+		case <-time.After(4 * time.Second):
 		}
 
 		return cmd, filePath, nil
@@ -219,8 +300,6 @@ func StopRecording(cmd *exec.Cmd, filePath string) (string, int, int, error) {
 	return base64.StdEncoding.EncodeToString(cleanWav), durationSec, peakPct, nil
 }
 
-// normalizeWAV converts any WAV/PCM input (8-bit, 16-bit, 32-bit float, or Extensible) into a
-// boosted 16-bit standard PCM WAV file.
 func normalizeWAV(raw []byte) ([]byte, int, int, error) {
 	audioFormat := uint16(1)
 	channels := uint16(1)
@@ -241,7 +320,6 @@ func normalizeWAV(raw []byte) ([]byte, int, int, error) {
 			bps := binary.LittleEndian.Uint16(raw[fmtIdx+22 : fmtIdx+24])
 
 			if af == 0xFFFE && fmtIdx+34 <= len(raw) {
-				// WAVE_FORMAT_EXTENSIBLE: actual subformat tag is at offset +32
 				af = binary.LittleEndian.Uint16(raw[fmtIdx+32 : fmtIdx+34])
 			}
 			audioFormat = af
@@ -268,7 +346,6 @@ func normalizeWAV(raw []byte) ([]byte, int, int, error) {
 		return nil, 0, 0, fmt.Errorf("recorded audio is too short")
 	}
 
-	// Decode input samples into 16-bit signed mono samples
 	var samples []int16
 	switch {
 	case audioFormat == 3 && bitsPerSample == 32:
@@ -300,14 +377,12 @@ func normalizeWAV(raw []byte) ([]byte, int, int, error) {
 		return nil, 0, 0, fmt.Errorf("no audio samples captured")
 	}
 
-	// 1. Remove DC offset
 	var sum int64
 	for _, s := range samples {
 		sum += int64(s)
 	}
 	dcOffset := int16(sum / int64(len(samples)))
 
-	// 2. Measure peak amplitude
 	var maxAmp int32
 	for i := range samples {
 		adj := int32(samples[i]) - int32(dcOffset)
@@ -330,7 +405,6 @@ func normalizeWAV(raw []byte) ([]byte, int, int, error) {
 		peakPct = 1
 	}
 
-	// 3. Apply auto-gain boost if voice was quiet (up to 16x boost, targeting ~85% volume)
 	if maxAmp > 25 && maxAmp < 24000 {
 		gain := float64(28000) / float64(maxAmp)
 		if gain > 16.0 {
@@ -347,7 +421,6 @@ func normalizeWAV(raw []byte) ([]byte, int, int, error) {
 		}
 	}
 
-	// 4. Encode clean 44-byte 16-bit mono PCM WAV
 	pcmLen := len(samples) * 2
 	byteRate := sampleRate * 2
 	out := make([]byte, 44+pcmLen)
@@ -356,12 +429,12 @@ func normalizeWAV(raw []byte) ([]byte, int, int, error) {
 	copy(out[8:12], "WAVE")
 	copy(out[12:16], "fmt ")
 	binary.LittleEndian.PutUint32(out[16:20], 16)
-	binary.LittleEndian.PutUint16(out[20:22], 1) // Standard PCM = 1
-	binary.LittleEndian.PutUint16(out[22:24], 1) // Mono = 1 channel
+	binary.LittleEndian.PutUint16(out[20:22], 1)
+	binary.LittleEndian.PutUint16(out[22:24], 1)
 	binary.LittleEndian.PutUint32(out[24:28], sampleRate)
 	binary.LittleEndian.PutUint32(out[28:32], byteRate)
-	binary.LittleEndian.PutUint16(out[32:34], 2)  // BlockAlign = 2
-	binary.LittleEndian.PutUint16(out[34:36], 16) // BitsPerSample = 16
+	binary.LittleEndian.PutUint16(out[32:34], 2)
+	binary.LittleEndian.PutUint16(out[34:36], 16)
 	copy(out[36:40], "data")
 	binary.LittleEndian.PutUint32(out[40:44], uint32(pcmLen))
 
@@ -408,7 +481,6 @@ func SaveVoiceNote(seqID, base64Audio string) (int, error) {
 	return durationSec, nil
 }
 
-// GetVoiceNoteDuration returns the duration of a saved voice note and verifies it exists.
 func GetVoiceNoteDuration(seqID string) (int, error) {
 	filePath := GetVoiceNotePath(seqID)
 	raw, err := os.ReadFile(filePath)
@@ -429,7 +501,6 @@ func DeleteVoiceNote(seqID string) {
 	_ = os.Remove(GetVoiceNotePath(seqID))
 }
 
-// PlayAudioSync plays a .wav file synchronously, trying all available OS players until one succeeds.
 func PlayAudioSync(filePath string) error {
 	switch runtime.GOOS {
 	case "linux":
