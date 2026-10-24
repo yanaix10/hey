@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -22,6 +23,17 @@ import (
 )
 
 const SessionPort = 4243
+
+func getLocalUser() string {
+	user := os.Getenv("USER")
+	if user == "" {
+		user = os.Getenv("USERNAME")
+	}
+	if user == "" {
+		user = "peer"
+	}
+	return strings.ToLower(strings.TrimSpace(user))
+}
 
 // --- PEER MANAGEMENT ---
 
@@ -50,6 +62,7 @@ func savePeerMap(peers map[string]string) {
 }
 
 func savePeer(username, secret string) {
+	username = strings.ToLower(strings.TrimSpace(username))
 	peers := loadPeers()
 	peers[username] = secret
 	savePeerMap(peers)
@@ -68,6 +81,7 @@ func listPeers() {
 }
 
 func unpair(username string) {
+	username = strings.ToLower(strings.TrimSpace(username))
 	peers := loadPeers()
 	if _, exists := peers[username]; exists {
 		delete(peers, username)
@@ -87,15 +101,17 @@ func clearPeers() {
 
 func main() {
 	ensureDaemonRunning()
-	
+
 	if len(os.Args) < 2 {
-		fmt.Println("Usage:\n  hey <username>\n  hey join <target>\n  hey peers\n  hey unpair <user>\n  hey clear")
+		fmt.Println("Usage:\n  hey <username>\n  hey users\n  hey peers\n  hey unpair <user>\n  hey clear")
 		os.Exit(1)
 	}
 
 	command := os.Args[1]
 
 	switch command {
+	case "users":
+		listOnlineUsers()
 	case "join":
 		if len(os.Args) < 3 {
 			log.Fatal("Usage: hey join <target>")
@@ -116,11 +132,29 @@ func main() {
 	}
 }
 
+func listOnlineUsers() {
+	conn, err := discovery.DialRelay()
+	if err != nil {
+		fmt.Println("Could not reach relay:", err)
+		return
+	}
+	defer conn.Close()
+
+	fmt.Fprintln(conn, "LIST")
+	line, _ := bufio.NewReader(conn).ReadString('\n')
+	line = strings.TrimSpace(line)
+	if line == "" {
+		fmt.Println("No users currently online.")
+		return
+	}
+	fmt.Println("🟢 Online users:", strings.ReplaceAll(line, ",", ", "))
+}
+
 func runSend(target string) {
 	target = strings.TrimPrefix(target, "hey@")
 	target = strings.TrimPrefix(target, "@")
+	target = strings.ToLower(strings.TrimSpace(target))
 
-	// Check if peer is already trusted in peers.json
 	peers := loadPeers()
 	savedPin, isTrusted := peers[target]
 
@@ -184,13 +218,7 @@ func runLocalSend(target, ip, pin string, isTrusted bool) {
 }
 
 func runRelaySend(target, pin string, isTrusted bool) {
-	sender := os.Getenv("USER")
-	if sender == "" {
-		sender = os.Getenv("USERNAME")
-	}
-	if sender == "" {
-		sender = "peer"
-	}
+	sender := getLocalUser()
 
 	conn, err := discovery.DialRelay()
 	if err != nil {
@@ -230,15 +258,27 @@ func printPIN(pin string) {
 }
 
 func completeHostHandshake(peerConn net.Conn, pin string) {
+	localUser := getLocalUser()
+
+	// 1. Send 16-byte salt followed by host username so receiver can check peers.json
 	salt := make([]byte, 16)
 	_, _ = rand.Read(salt)
 	_, _ = peerConn.Write(salt)
+	_, _ = peerConn.Write([]byte(localUser + "\n"))
 
+	// 2. Read 32-byte response hash and peer username
+	reader := bufio.NewReader(peerConn)
 	responseHash := make([]byte, 32)
-	if _, err := io.ReadFull(peerConn, responseHash); err != nil {
+	if _, err := io.ReadFull(reader, responseHash); err != nil {
 		log.Fatalf("Peer disconnected during handshake.")
 	}
+	peerUser, _ := reader.ReadString('\n')
+	peerUser = strings.ToLower(strings.TrimSpace(peerUser))
+	if peerUser == "" {
+		peerUser = "peer"
+	}
 
+	// 3. Verify hash and send 1-byte verdict
 	expectedHash := sha256.Sum256(append([]byte(pin), salt...))
 	if !bytes.Equal(responseHash, expectedHash[:]) {
 		_, _ = peerConn.Write([]byte{0})
@@ -247,22 +287,6 @@ func completeHostHandshake(peerConn net.Conn, pin string) {
 
 	_, _ = peerConn.Write([]byte{1})
 	sessionKey := auth.DeriveKey(pin, salt)
-
-	localUser := os.Getenv("USER")
-	if localUser == "" {
-		localUser = os.Getenv("USERNAME")
-	}
-	if localUser == "" {
-		localUser = "host"
-	}
-
-	_, _ = peerConn.Write([]byte(localUser + "\n"))
-	reader := bufio.NewReader(peerConn)
-	peerUser, _ := reader.ReadString('\n')
-	peerUser = strings.TrimSpace(peerUser)
-	if peerUser == "" {
-		peerUser = "Peer"
-	}
 
 	savePeer(peerUser, pin)
 
@@ -290,61 +314,51 @@ func runJoin(targetAddr string) {
 	}
 	defer conn.Close()
 
+	// 1. Read 16-byte salt and host username
+	reader := bufio.NewReader(conn)
 	salt := make([]byte, 16)
-	if _, err := io.ReadFull(conn, salt); err != nil {
+	if _, err := io.ReadFull(reader, salt); err != nil {
 		log.Fatalf("Handshake failed to receive challenge.")
 	}
-
-	// Read peer's username early to check if they are trusted
-	localUser := os.Getenv("USER")
-	if localUser == "" {
-		localUser = os.Getenv("USERNAME")
+	peerUser, _ := reader.ReadString('\n')
+	peerUser = strings.ToLower(strings.TrimSpace(peerUser))
+	if peerUser == "" {
+		peerUser = "peer"
 	}
 
-	// We send our username first so the joining side knows who is connecting
-	// (or we can prompt if not trusted)
-	var enteredPIN string
+	// 2. Check if this specific host is already in peers.json
 	peers := loadPeers()
+	enteredPIN, isTrusted := peers[peerUser]
 
-	// Prompt for PIN if not in trusted peers
-	fmt.Print("\nEnter 6-digit confirmation code (Press Enter if trusted peer): ")
-	stdinReader := bufio.NewReader(os.Stdin)
-	enteredPIN, _ = stdinReader.ReadString('\n')
-	enteredPIN = strings.TrimSpace(enteredPIN)
-
-	// If empty input, check if we have any matching peer or if we can infer
-	if enteredPIN == "" {
-		// If we only have one trusted peer or want to attempt auto-match
-		for _, p := range peers {
-			enteredPIN = p
-			break
+	if isTrusted {
+		fmt.Printf("Verified trusted peer '%s'. Connecting automatically...\n", peerUser)
+	} else {
+		fmt.Printf("\nEnter 6-digit confirmation code from %s: ", peerUser)
+		stdinReader := bufio.NewReader(os.Stdin)
+		enteredPIN, _ = stdinReader.ReadString('\n')
+		enteredPIN = strings.TrimSpace(enteredPIN)
+		if enteredPIN == "" {
+			log.Fatal("PIN required for new peer.")
 		}
 	}
 
-	if enteredPIN == "" {
-		log.Fatal("PIN required for unknown peer.")
-	}
-
+	// 3. Send 32-byte hash and our username
+	localUser := getLocalUser()
 	responseHash := sha256.Sum256(append([]byte(enteredPIN), salt...))
 	_, _ = conn.Write(responseHash[:])
+	_, _ = conn.Write([]byte(localUser + "\n"))
 
+	// 4. Read 1-byte verdict
 	verdict := make([]byte, 1)
-	_, _ = io.ReadFull(conn, verdict)
-	if verdict[0] != 1 {
+	if _, err := io.ReadFull(reader, verdict); err != nil || verdict[0] != 1 {
+		if isTrusted {
+			unpair(peerUser)
+			log.Fatal("\n[!] Stored key out of sync. Peer unpaired—please reconnect to enter a fresh PIN.")
+		}
 		log.Fatal("\n[!] Connection rejected: Invalid PIN.")
 	}
 
 	sessionKey := auth.DeriveKey(enteredPIN, salt)
-
-	reader := bufio.NewReader(conn)
-	peerUser, _ := reader.ReadString('\n')
-	peerUser = strings.TrimSpace(peerUser)
-	if peerUser == "" {
-		peerUser = "Peer"
-	}
-
-	_, _ = conn.Write([]byte(localUser + "\n"))
-
 	savePeer(peerUser, enteredPIN)
 
 	if err := ui.StartChat(conn, sessionKey, peerUser); err != nil {
@@ -353,19 +367,22 @@ func runJoin(targetAddr string) {
 }
 
 func ensureDaemonRunning() {
-	// Check if heyd is already listening on local port 4242
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", discovery.Port), 200*time.Millisecond)
 	if err == nil {
 		conn.Close()
-		return // Already running
+		return
 	}
 
-	// Not running — launch heyd silently in the background
+	binName := "heyd"
+	if runtime.GOOS == "windows" {
+		binName = "heyd.exe"
+	}
+
 	exe, err := os.Executable()
 	if err == nil {
-		heydPath := filepath.Join(filepath.Dir(exe), "heyd")
+		heydPath := filepath.Join(filepath.Dir(exe), binName)
 		if _, err := os.Stat(heydPath); err != nil {
-			heydPath = "heyd"
+			heydPath = binName
 		}
 		_ = exec.Command(heydPath).Start()
 		time.Sleep(500 * time.Millisecond)

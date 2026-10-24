@@ -23,6 +23,7 @@ func main() {
 	if user == "" {
 		user = "peer"
 	}
+	user = strings.ToLower(strings.TrimSpace(user))
 
 	// 1. Background 10-Minute Garbage Collector (Wipes expired JSON & WAV files)
 	go func() {
@@ -35,8 +36,7 @@ func main() {
 	// 2. Global Relay Listener (Auto-reconnects if the server drops)
 	go runRelayListener(user)
 
-	// 3. Local LAN mDNS Broadcast & Listener
-	
+	// 3. Local LAN Listener
 	runLocalListener()
 }
 
@@ -48,22 +48,22 @@ func runRelayListener(user string) {
 			continue
 		}
 
-		fmt.Fprintf(conn, "LISTEN %s\n", user)
+		// Must match cmd/hey-relay/main.go ("REGISTER <username>")
+		fmt.Fprintf(conn, "REGISTER %s\n", user)
 		scanner := bufio.NewScanner(conn)
 
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
-			// Expected format from relay: INCOMING <sender> <sessionID>
-			if strings.HasPrefix(line, "INCOMING ") {
-				parts := strings.SplitN(line, " ", 3)
+			if line == "HEARTBEAT" {
+				continue
+			}
+
+			// Relay sends: PING <sessionID> <sender>
+			if strings.HasPrefix(line, "PING ") {
+				parts := strings.Fields(line)
 				if len(parts) == 3 {
-					sender, sessionID := parts[1], parts[2]
-					if promptNativePopup(sender) {
-						conn.Write([]byte{1})
-						spawnTerminal("relay:" + sessionID)
-					} else {
-						conn.Write([]byte{0})
-					}
+					sessionID, sender := parts[1], parts[2]
+					go handleRelayPing(sessionID, sender)
 				}
 			}
 		}
@@ -72,6 +72,23 @@ func runRelayListener(user string) {
 		}
 		conn.Close()
 		time.Sleep(3 * time.Second)
+	}
+}
+
+func handleRelayPing(sessionID, sender string) {
+	accepted := promptNativePopup(sender)
+
+	decConn, err := discovery.DialRelay()
+	if err != nil {
+		return
+	}
+	defer decConn.Close()
+
+	if accepted {
+		fmt.Fprintf(decConn, "DECISION %s accepted\n", sessionID)
+		spawnTerminal("relay:" + sessionID)
+	} else {
+		fmt.Fprintf(decConn, "DECISION %s declined\n", sessionID)
 	}
 }
 
@@ -115,27 +132,23 @@ func handleLocalRequest(conn net.Conn) {
 	}
 }
 
-// promptNativePopup triggers an OS-native Accept/Decline dialog
 func promptNativePopup(sender string) bool {
 	msg := fmt.Sprintf("Incoming encrypted chat from %s. Accept?", sender)
 
 	switch runtime.GOOS {
 	case "linux":
-		// 1. Try modern dunstify/notify-send action buttons
 		if path, err := exec.LookPath("dunstify"); err == nil {
 			out, err := exec.Command(path, "-A", "yes,Accept", "-A", "no,Decline", "HeyChat", msg).Output()
 			if err == nil {
 				return strings.TrimSpace(string(out)) == "yes"
 			}
 		}
-		// 2. Fallback to Zenity or KDialog modal
 		if path, err := exec.LookPath("zenity"); err == nil {
 			return exec.Command(path, "--question", "--title=HeyChat", "--text="+msg).Run() == nil
 		}
 		if path, err := exec.LookPath("kdialog"); err == nil {
 			return exec.Command(path, "--yesno", msg, "--title", "HeyChat").Run() == nil
 		}
-		// 3. Fallback: notify and auto-spawn terminal so PIN acts as the gatekeeper
 		_ = exec.Command("notify-send", "HeyChat", "Incoming chat from "+sender).Run()
 		return true
 
@@ -152,7 +165,6 @@ func promptNativePopup(sender string) bool {
 	return false
 }
 
-// spawnTerminal launches a new OS terminal window running `hey join <targetAddr>`
 func spawnTerminal(targetAddr string) {
 	switch runtime.GOOS {
 	case "linux":
